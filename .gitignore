@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/
+bots/
+replays/
+history.json
+match_counters.json
+*.age
+*.log
+dist/
+artifacts/
+cache/

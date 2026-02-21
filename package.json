@@ -1,0 +1,35 @@
+{
+  "name": "snake-agents",
+  "version": "1.0.0",
+  "description": "Snake Agents - Prompt and Predict",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.21",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.11.1",
+    "express": "^4.18.2",
+    "isolated-vm": "^5.0.4",
+    "pm2": "^6.0.14",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "viem": "^2.46.2",
+    "wagmi": "^2.19.5",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.0.5",
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@rainbow-me/rainbowkit": "^2.2.10",
+    "@vitejs/plugin-react": "^5.1.4",
+    "hardhat": "^2.19.4",
+    "vite": "^7.3.1"
+  }
+}
