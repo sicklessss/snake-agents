@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAccount, useWriteContract, useWaitForTransactionReceipt, useConnect, useDisconnect, useSignMessage, useSendTransaction, createConfig, http as wagmiHttp } from 'wagmi';
 import { injected, metaMask, coinbaseWallet } from 'wagmi/connectors';
 import { parseEther, parseUnits, stringToHex, padHex, createPublicClient, http } from 'viem';
@@ -13,16 +13,17 @@ import foodSvgUrl from './assets/food.svg';
 const config = createConfig({
   chains: [baseSepolia],
   connectors: [
+    injected(),
     metaMask(),
     coinbaseWallet({ appName: 'Snake Agents' }),
-    injected(),
   ],
-  transports: { [baseSepolia.id]: wagmiHttp() },
+  multiInjectedProviderDiscovery: true,
+  transports: { [baseSepolia.id]: wagmiHttp('https://sepolia.base.org') },
 });
 
 const queryClient = new QueryClient();
 
-const publicClient = createPublicClient({ chain: baseSepolia, transport: http() });
+const publicClient = createPublicClient({ chain: baseSepolia, transport: http('https://sepolia.base.org') });
 
 
 const PERFORMANCE_RULES = `游戏介绍
@@ -137,6 +138,7 @@ function WalletButton() {
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
+          gas: 200_000n,
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${claimable.length}...`);
@@ -458,9 +460,10 @@ function BotManagement() {
     setEditBusy(false);
   };
 
-  // Fetch user's bots from server
+  // Fetch user's bots from server (clear on wallet switch)
   useEffect(() => {
-    if (!address) { setBots([]); return; }
+    setBots([]); // Clear immediately when address changes
+    if (!address) return;
     const fetchBots = async () => {
       try {
         const res = await fetch('/api/user/onchain-bots?wallet=' + address);
@@ -475,17 +478,17 @@ function BotManagement() {
     return () => clearInterval(t);
   }, [address]);
 
-  // Register: server creates bot on-chain first (blocking), then user calls registerBot
+  // Register: claim bot via regCode, then register on-chain
   const handleRegister = async () => {
     if (!isConnected) return alert('Connect Wallet');
-    if (!newName) return alert('Enter Bot Name');
+    if (!newName) return alert('Enter Registration Code');
 
     try {
-      setRegStatus('Creating bot (waiting for on-chain confirmation)...');
+      setRegStatus('Claiming bot via registration code...');
       const res = await fetch('/api/bot/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newName, owner: address, botType: 'agent' })
+        body: JSON.stringify({ regCode: newName, owner: address })
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -498,6 +501,10 @@ function BotManagement() {
         return;
       }
 
+      // Wait for on-chain state to propagate to all RPC nodes (MetaMask uses Infura)
+      setRegStatus('Waiting for on-chain confirmation...');
+      await new Promise(r => setTimeout(r, 5000));
+
       setRegStatus('Sign on-chain registration (0.01 ETH)...');
       const botId32 = nameToBytes32(data.id);
       setRegPending(true);
@@ -509,6 +516,7 @@ function BotManagement() {
           functionName: 'registerBot',
           args: [botId32, '0x0000000000000000000000000000000000000000' as `0x${string}`],
           value: parseEther('0.01'),
+          gas: 500_000n,
         });
         setRegHash(hash as `0x${string}`);
       } catch (e: any) {
@@ -582,6 +590,7 @@ function BotManagement() {
           abi: SNAKE_BOT_NFT_ABI,
           functionName: 'approve',
           args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
+          gas: 100_000n,
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
         // Wait for on-chain state to propagate and wallet nonce to update
@@ -599,14 +608,30 @@ function BotManagement() {
       }
 
       // Step 2: List on marketplace
-      setSellStatus('Listing on marketplace...');
+      setSellStatus('2/2 Listing on marketplace...');
+      await new Promise(r => setTimeout(r, 2000));
       const priceWei = parseEther(sellPrice);
-      const listTx = await writeContractAsync({
-        address: CONTRACTS.botMarketplace as `0x${string}`,
-        abi: BOT_MARKETPLACE_ABI,
-        functionName: 'list',
-        args: [tokenId, priceWei],
-      });
+      let listTx: string | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          listTx = await writeContractAsync({
+            address: CONTRACTS.botMarketplace as `0x${string}`,
+            abi: BOT_MARKETPLACE_ABI,
+            functionName: 'list',
+            args: [tokenId, priceWei],
+          }) as unknown as string;
+          break;
+        } catch (listErr: any) {
+          const errMsg = (listErr?.shortMessage || listErr?.message || '').toLowerCase();
+          if (attempt < 2 && (errMsg.includes('nonce') || errMsg.includes('underpriced') || errMsg.includes('already known') || errMsg.includes('reverted'))) {
+            setSellStatus(`Retrying... (${attempt + 1}/3)`);
+            await new Promise(r => setTimeout(r, 4000));
+            continue;
+          }
+          throw listErr;
+        }
+      }
+      if (!listTx) throw new Error('List transaction failed after retries');
       await publicClient.waitForTransactionReceipt({ hash: listTx as `0x${string}` });
 
       setSellStatus('Listed! Your bot is now on the marketplace.');
@@ -816,7 +841,7 @@ function BotManagement() {
 
       {(
         <div style={{ display: 'flex', gap: '6px', marginTop: '8px', alignItems: 'center' }}>
-          <input placeholder="Bot Name" value={newName} onChange={e => setNewName(e.target.value.replace(/[^a-zA-Z0-9_\- ]/g, '').slice(0, 24))} maxLength={24} style={{ flex: 1 }} />
+          <input placeholder="Registration Code" value={newName} onChange={e => setNewName(e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8))} maxLength={8} style={{ flex: 1 }} />
           <button
             onClick={handleRegister}
             disabled={regPending || regConfirming}
@@ -926,6 +951,7 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
           abi: ERC20_ABI,
           functionName: 'approve',
           args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
+          gas: 100_000n,
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
       }
@@ -937,10 +963,20 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
         args: [BigInt(mid), botIdBytes32, usdcAmount],
+        gas: 300_000n,
       });
 
       setStatus('链上确认中...');
       await publicClient.waitForTransactionReceipt({ hash: betTx as `0x${string}` });
+
+      // Award score for betting
+      try {
+        await fetch('/api/score/bet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId }),
+        });
+      } catch (_) { /* score award is best-effort */ }
 
       setStatus(`✅ 预测成功！${amount} USDC 预测 ${botName} 赢`);
       setAmount('');
@@ -1025,8 +1061,9 @@ function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null })
       // Pay entry fee (0.001 ETH) via ETH transfer to backend wallet
       setStatus('Sign transaction (0.001 ETH)...');
       const txHash = await sendTransactionAsync({
-        to: '0xBa379b9AaF5eac6eCF9B532cb6563390De6edfEe' as `0x${string}`,
+        to: '0xe4b92D0B4D9Ae8EA89934D1C2E39aCbb86824DAF' as `0x${string}`,
         value: parseEther('0.001'),
+        gas: 21_000n,
       });
 
       setStatus('Confirming on-chain...');
@@ -1345,8 +1382,8 @@ function GameCanvas({
   );
 }
 
-// Airdrop points type labels (Chinese)
-const AIRDROP_TYPE_LABELS: Record<string, string> = {
+// Score type labels (Chinese)
+const SCORE_TYPE_LABELS: Record<string, string> = {
   register: '注册奖励',
   checkin: '每日签到',
   match_participate: '参赛奖励',
@@ -1357,12 +1394,11 @@ const AIRDROP_TYPE_LABELS: Record<string, string> = {
   referral_l2: '邀请奖励 L2',
 };
 
-// Full-page Points view — now shows Airdrop Points + Prediction Balance
+// Full-page Points view — shows Score
 function PointsPage() {
   const { address } = useAccount();
   const { signMessageAsync } = useSignMessage();
-  const [myAirdrop, setMyAirdrop] = useState<any>(null);
-  const [myBalance, setMyBalance] = useState<any>(null);
+  const [myScore, setMyScore] = useState<any>(null);
   const [leaderboard, setLeaderboard] = useState<any[]>([]);
   const [checkinStatus, setCheckinStatus] = useState('');
   const [checkinBusy, setCheckinBusy] = useState(false);
@@ -1370,13 +1406,11 @@ function PointsPage() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [adRes, balRes, lbRes] = await Promise.all([
-          address ? fetch('/api/airdrop/my?address=' + address) : Promise.resolve(null),
-          address ? fetch('/api/points/my?address=' + address) : Promise.resolve(null),
-          fetch('/api/airdrop/leaderboard'),
+        const [adRes, lbRes] = await Promise.all([
+          address ? fetch('/api/score/my?address=' + address) : Promise.resolve(null),
+          fetch('/api/score/leaderboard'),
         ]);
-        if (adRes && adRes.ok) setMyAirdrop(await adRes.json());
-        if (balRes && balRes.ok) setMyBalance(await balRes.json());
+        if (adRes && adRes.ok) setMyScore(await adRes.json());
         if (lbRes.ok) setLeaderboard(await lbRes.json());
       } catch (e) { console.error(e); }
     };
@@ -1395,7 +1429,7 @@ function PointsPage() {
       const message = `SnakeAgents Checkin\nAddress: ${address}\nTimestamp: ${timestamp}`;
       const signature = await signMessageAsync({ message });
 
-      const res = await fetch('/api/airdrop/checkin', {
+      const res = await fetch('/api/score/checkin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ address, signature, timestamp }),
@@ -1404,8 +1438,8 @@ function PointsPage() {
       if (res.ok && data.ok) {
         setCheckinStatus(`+${data.points} pts! ${data.message}`);
         // Refresh data
-        const adRes = await fetch('/api/airdrop/my?address=' + address);
-        if (adRes.ok) setMyAirdrop(await adRes.json());
+        const adRes = await fetch('/api/score/my?address=' + address);
+        if (adRes.ok) setMyScore(await adRes.json());
       } else {
         setCheckinStatus(data.message || data.error || 'Failed');
       }
@@ -1417,30 +1451,30 @@ function PointsPage() {
 
   return (
     <div style={{ padding: '24px', width: '100%', maxWidth: '800px', margin: '0 auto' }}>
-      <h2 style={{ color: 'var(--neon-green)', textAlign: 'center', marginBottom: '20px' }}>Airdrop Points</h2>
+      <h2 style={{ color: 'var(--neon-green)', textAlign: 'center', marginBottom: '20px' }}>积分</h2>
 
-      {/* Airdrop Points Card */}
+      {/* Score Card */}
       <div className="panel-section" style={{ marginBottom: '24px' }}>
-        <h3>My Airdrop Points</h3>
+        <h3>我的积分</h3>
         {!address ? (
           <div className="panel-card muted">Connect wallet to see your points</div>
-        ) : !myAirdrop ? (
+        ) : !myScore ? (
           <div className="panel-card muted">Loading...</div>
         ) : (
           <div className="panel-card">
             <div style={{ display: 'flex', justifyContent: 'space-around', textAlign: 'center', marginBottom: '12px' }}>
               <div>
-                <div style={{ fontSize: '2rem', fontWeight: 'bold', color: 'var(--neon-green)' }}>{myAirdrop.total || 0}</div>
-                <div className="muted">Airdrop Points</div>
+                <div style={{ fontSize: '2rem', fontWeight: 'bold', color: 'var(--neon-green)' }}>{myScore.total || 0}</div>
+                <div className="muted">积分</div>
               </div>
-              {myAirdrop.rank && (
+              {myScore.rank && (
                 <div>
-                  <div style={{ fontSize: '2rem', fontWeight: 'bold', color: 'var(--neon-blue)' }}>#{myAirdrop.rank}</div>
+                  <div style={{ fontSize: '2rem', fontWeight: 'bold', color: 'var(--neon-blue)' }}>#{myScore.rank}</div>
                   <div className="muted">Rank</div>
                 </div>
               )}
               <div>
-                <div style={{ fontSize: '2rem', fontWeight: 'bold', color: '#ff8800' }}>{myAirdrop.checkin?.streak || 0}</div>
+                <div style={{ fontSize: '2rem', fontWeight: 'bold', color: '#ff8800' }}>{myScore.checkin?.streak || 0}</div>
                 <div className="muted">Streak</div>
               </div>
             </div>
@@ -1449,42 +1483,34 @@ function PointsPage() {
             <div style={{ textAlign: 'center', marginBottom: '12px' }}>
               <button
                 onClick={handleCheckin}
-                disabled={checkinBusy || !(myAirdrop.checkin?.canCheckin)}
+                disabled={checkinBusy || !(myScore.checkin?.canCheckin)}
                 style={{
                   padding: '10px 24px', fontSize: '1rem', fontWeight: 'bold',
-                  background: myAirdrop.checkin?.canCheckin ? 'var(--neon-green)' : '#333',
-                  color: myAirdrop.checkin?.canCheckin ? '#000' : '#666',
-                  border: 'none', borderRadius: '8px', cursor: myAirdrop.checkin?.canCheckin ? 'pointer' : 'default',
+                  background: myScore.checkin?.canCheckin ? 'var(--neon-green)' : '#333',
+                  color: myScore.checkin?.canCheckin ? '#000' : '#666',
+                  border: 'none', borderRadius: '8px', cursor: myScore.checkin?.canCheckin ? 'pointer' : 'default',
                 }}
               >
-                {checkinBusy ? 'Signing...' : myAirdrop.checkin?.canCheckin ? 'Daily Check-in (+10 pts)' : 'Checked in today'}
+                {checkinBusy ? 'Signing...' : myScore.checkin?.canCheckin ? 'Daily Check-in (+10 pts)' : 'Checked in today'}
               </button>
               {checkinStatus && <div className="muted" style={{ marginTop: '6px' }}>{checkinStatus}</div>}
             </div>
 
-            {/* Prediction Balance */}
-            {myBalance && (
-              <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(0,136,255,0.1)', borderRadius: '6px', marginBottom: '12px' }}>
-                <span className="muted">Prediction Balance: </span>
-                <span style={{ color: 'var(--neon-blue)', fontWeight: 'bold' }}>{myBalance.points || 0} pts</span>
-              </div>
-            )}
-
             {/* Points breakdown */}
             <div style={{ fontSize: '0.75rem', color: '#888', marginBottom: '8px', textAlign: 'center' }}>
-              Airdrop points are accumulate-only (never decrease). Prediction balance is separate.
+              积分只会累积增加，不会减少。
             </div>
 
-            {myAirdrop.history && myAirdrop.history.length > 0 && (
+            {myScore.history && myScore.history.length > 0 && (
               <>
                 <h4 style={{ color: '#aaa', fontSize: '0.85rem', marginBottom: '6px' }}>Recent Activity</h4>
                 <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
-                  {myAirdrop.history.map((h: any, i: number) => (
+                  {myScore.history.map((h: any, i: number) => (
                     <div key={i} style={{
                       display: 'flex', justifyContent: 'space-between', padding: '4px 8px',
                       borderBottom: '1px solid #1b1b2b', fontSize: '0.8rem',
                     }}>
-                      <span className="muted">{AIRDROP_TYPE_LABELS[h.type] || h.type}</span>
+                      <span className="muted">{SCORE_TYPE_LABELS[h.type] || h.type}</span>
                       <span style={{ color: 'var(--neon-green)' }}>+{h.points}</span>
                     </div>
                   ))}
@@ -1495,7 +1521,7 @@ function PointsPage() {
         )}
       </div>
 
-      {/* Airdrop Points Rules */}
+      {/* Score Rules */}
       <div className="panel-section" style={{ marginBottom: '24px' }}>
         <h3>How to Earn Points</h3>
         <div className="panel-card" style={{ fontSize: '0.82rem', lineHeight: '1.7' }}>
@@ -1505,16 +1531,15 @@ function PointsPage() {
             <span>7-day streak bonus</span><span style={{ color: 'var(--neon-green)' }}>+30</span>
             <span>Bot participates in match</span><span style={{ color: 'var(--neon-green)' }}>+5</span>
             <span>1st / 2nd / 3rd place</span><span style={{ color: 'var(--neon-green)' }}>+50 / +30 / +20</span>
-            <span>Place a prediction</span><span style={{ color: 'var(--neon-green)' }}>+amount USDC</span>
-            <span>Win a prediction</span><span style={{ color: 'var(--neon-green)' }}>profit x 0.5</span>
+            <span>下注预测</span><span style={{ color: 'var(--neon-green)' }}>+等额积分</span>
             <span>Invite L1 / L2</span><span style={{ color: 'var(--neon-green)' }}>+100 / +50</span>
           </div>
         </div>
       </div>
 
-      {/* Airdrop Leaderboard */}
+      {/* Score Leaderboard */}
       <div className="panel-section">
-        <h3>Airdrop Leaderboard (Top 50)</h3>
+        <h3>积分排行榜 (Top 50)</h3>
         <ul className="fighter-list">
           {leaderboard.map((p: any, i: number) => (
             <li key={i} className="fighter-item alive">
@@ -1559,7 +1584,9 @@ function PortfolioPage() {
   const { writeContractAsync } = useWriteContract();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'positions' | 'history'>('positions');
+  const [tab, setTab] = useState<'positions' | 'history' | 'mybots'>('positions');
+  const [myBots, setMyBots] = useState<any[]>([]);
+  const [botsLoading, setBotsLoading] = useState(false);
   const [claiming, setClaiming] = useState(false);
   const [claimStatus, setClaimStatus] = useState('');
 
@@ -1579,6 +1606,33 @@ function PortfolioPage() {
     return () => clearInterval(t);
   }, [address]);
 
+  useEffect(() => {
+    if (tab !== 'mybots' || !address) return;
+    setBotsLoading(true);
+    const loadBots = async () => {
+      try {
+        const [nftRes, lbPerfRes, lbCompRes] = await Promise.all([
+          fetch(`/api/user/onchain-bots?wallet=${address}`),
+          fetch('/api/leaderboard/performance'),
+          fetch('/api/leaderboard/competitive'),
+        ]);
+        const nftData = nftRes.ok ? await nftRes.json() : { bots: [] };
+        const perfLb: any[] = lbPerfRes.ok ? await lbPerfRes.json() : [];
+        const compLb: any[] = lbCompRes.ok ? await lbCompRes.json() : [];
+        const winsMap: Record<string, number> = {};
+        perfLb.forEach((e: any) => { winsMap[e.name] = (winsMap[e.name] || 0) + e.wins; });
+        compLb.forEach((e: any) => { winsMap[e.name] = (winsMap[e.name] || 0) + e.wins; });
+        const bots = (nftData.bots || []).map((b: any) => ({
+          ...b,
+          wins: winsMap[b.botName] || winsMap[b.name] || 0,
+        }));
+        setMyBots(bots);
+      } catch (_) {}
+      setBotsLoading(false);
+    };
+    loadBots();
+  }, [tab, address]);
+
   const handleClaimAll = async () => {
     if (!data?.claimable?.length || claiming) return;
     setClaiming(true);
@@ -1591,6 +1645,7 @@ function PortfolioPage() {
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
+          gas: 200_000n,
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${data.claimable.length}...`);
@@ -1687,6 +1742,17 @@ function PortfolioPage() {
         >
           History
         </button>
+        <button
+          onClick={() => setTab('mybots')}
+          style={{
+            flex: 1, padding: '10px', borderRadius: '8px', border: '1px solid #2a2a4a',
+            background: tab === 'mybots' ? 'rgba(0,255,136,0.15)' : 'transparent',
+            color: tab === 'mybots' ? 'var(--neon-green)' : '#888',
+            cursor: 'pointer', fontFamily: 'Orbitron, monospace', fontWeight: 'bold', fontSize: '0.82rem',
+          }}
+        >
+          My Bots
+        </button>
       </div>
 
       {/* Content */}
@@ -1713,7 +1779,7 @@ function PortfolioPage() {
             </ul>
           )}
         </div>
-      ) : (
+      ) : tab === 'history' ? (
         <div className="panel-section">
           <h3>Bet History</h3>
           {(!data?.betHistory || data.betHistory.length === 0) ? (
@@ -1741,7 +1807,28 @@ function PortfolioPage() {
             </ul>
           )}
         </div>
-      )}
+      ) : tab === 'mybots' ? (
+        <div className="panel-section">
+          <h3>My Bots (NFTs)</h3>
+          {botsLoading ? (
+            <div className="panel-card muted" style={{ textAlign: 'center', padding: 24 }}>Loading...</div>
+          ) : myBots.length === 0 ? (
+            <div className="panel-card muted">No bots found for this wallet</div>
+          ) : (
+            <ul className="fighter-list">
+              {myBots.map((b: any, i: number) => (
+                <li key={i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className="fighter-name">{b.botName || b.name || b.botId}</span>
+                  <span style={{ display: 'flex', gap: '12px', fontSize: '0.8rem' }}>
+                    <span style={{ color: 'var(--neon-green)' }}>{b.wins}W</span>
+                    <span className="muted">{b.matchesPlayed || 0} played</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1787,6 +1874,7 @@ function MarketplacePage() {
         functionName: 'buy',
         args: [BigInt(tokenId)],
         value: BigInt(priceWei),
+        gas: 300_000n,
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
@@ -1822,6 +1910,7 @@ function MarketplacePage() {
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'cancel',
         args: [BigInt(item.tokenId)],
+        gas: 200_000n,
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
@@ -1904,6 +1993,352 @@ function MarketplacePage() {
   );
 }
 
+function ReplayPage() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const foodImgRef = useRef<HTMLImageElement | null>(null);
+  useEffect(() => {
+    const img = new Image();
+    img.src = foodSvgUrl;
+    img.onload = () => { foodImgRef.current = img; };
+  }, []);
+
+  const replayRef = useRef<any>(null);
+  const [replayLoaded, setReplayLoaded] = useState(false);
+  const [replayList, setReplayList] = useState<any[]>([]);
+  const [searchInput, setSearchInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [players, setPlayers] = useState<any[]>([]);
+  const [frameLabel, setFrameLabel] = useState('0 / 0');
+  const [matchInfo, setMatchInfo] = useState('');
+  const [timer, setTimer] = useState('--:--');
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+
+  const frameIndexRef = useRef(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const speedRef = useRef(1);
+
+  // Refs for state that the draw function needs to update
+  const setPlayersRef = useRef(setPlayers);
+  const setTimerRef = useRef(setTimer);
+  const setFrameLabelRef = useRef(setFrameLabel);
+  setPlayersRef.current = setPlayers;
+  setTimerRef.current = setTimer;
+  setFrameLabelRef.current = setFrameLabel;
+
+  useEffect(() => {
+    fetch('/api/replays').then(r => r.json()).then(setReplayList).catch(() => {});
+  }, []);
+
+  // Stable draw function via useCallback - only depends on refs
+  const drawFrame = useCallback((idx: number) => {
+    const rd = replayRef.current;
+    if (!rd?.frames?.length) return;
+    if (idx < 0 || idx >= rd.frames.length) return;
+    const frame = rd.frames[idx];
+    if (!frame) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = 600, h = 600;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const cellSize = w / 30;
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+
+    const isComp = (rd.arenaId || '').includes('competitive');
+    ctx.strokeStyle = isComp ? '#1a1020' : '#1a1a2e';
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 30; i++) {
+      ctx.beginPath(); ctx.moveTo(i * cellSize, 0); ctx.lineTo(i * cellSize, h); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i * cellSize); ctx.lineTo(w, i * cellSize); ctx.stroke();
+    }
+
+    if (frame.obstacles?.length) {
+      for (const obs of frame.obstacles) {
+        if (obs.solid) {
+          ctx.fillStyle = '#8b0000'; ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 4;
+          ctx.fillRect(obs.x * cellSize, obs.y * cellSize, cellSize, cellSize);
+          ctx.shadowBlur = 0; ctx.strokeStyle = '#ff4444'; ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(obs.x * cellSize + 2, obs.y * cellSize + 2);
+          ctx.lineTo((obs.x + 1) * cellSize - 2, (obs.y + 1) * cellSize - 2);
+          ctx.moveTo((obs.x + 1) * cellSize - 2, obs.y * cellSize + 2);
+          ctx.lineTo(obs.x * cellSize + 2, (obs.y + 1) * cellSize - 2);
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = 'rgba(255, 200, 0, 0.4)';
+          ctx.fillRect(obs.x * cellSize, obs.y * cellSize, cellSize, cellSize);
+          ctx.strokeStyle = 'rgba(255, 200, 0, 0.8)'; ctx.lineWidth = 1;
+          ctx.strokeRect(obs.x * cellSize, obs.y * cellSize, cellSize, cellSize);
+        }
+      }
+    }
+
+    (frame.food || []).forEach((f: any) => {
+      if (foodImgRef.current) {
+        const pad = cellSize * 0.1;
+        ctx.drawImage(foodImgRef.current, f.x * cellSize + pad, f.y * cellSize + pad, cellSize - pad * 2, cellSize - pad * 2);
+      } else {
+        ctx.fillStyle = '#ff0055'; ctx.shadowColor = '#ff0055'; ctx.shadowBlur = 10;
+        ctx.beginPath(); ctx.arc(f.x * cellSize + cellSize / 2, f.y * cellSize + cellSize / 2, cellSize / 3, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    });
+
+    (frame.players || []).forEach((p: any) => {
+      if (!p.body || p.body.length === 0) return;
+      ctx.fillStyle = p.color || '#00ff88'; ctx.shadowColor = p.color || '#00ff88';
+      ctx.shadowBlur = p.alive ? 8 : 0; ctx.globalAlpha = p.alive ? 1 : 0.4;
+      const pName = p.name || '';
+      p.body.forEach((seg: any, i: number) => {
+        if (i === 0) return;
+        ctx.fillRect(seg.x * cellSize + 1, seg.y * cellSize + 1, cellSize - 2, cellSize - 2);
+        const letterIdx = i - 1;
+        if (letterIdx < pName.length && pName[letterIdx]) {
+          ctx.save(); ctx.fillStyle = '#000'; ctx.shadowBlur = 0;
+          ctx.globalAlpha = p.alive ? 0.8 : 0.3;
+          ctx.font = `bold ${Math.max(cellSize * 0.6, 8)}px Orbitron, monospace`;
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(pName[letterIdx], seg.x * cellSize + cellSize / 2, seg.y * cellSize + cellSize / 2 + 1);
+          ctx.restore();
+          ctx.fillStyle = p.color || '#00ff88'; ctx.shadowColor = p.color || '#00ff88';
+          ctx.shadowBlur = p.alive ? 8 : 0; ctx.globalAlpha = p.alive ? 1 : 0.4;
+        }
+      });
+      const head = p.body[0];
+      let dir = { x: 1, y: 0 };
+      if (p.body.length >= 2) {
+        const neck = p.body[1];
+        const dx = head.x - neck.x, dy = head.y - neck.y;
+        if (dx !== 0 || dy !== 0) dir = { x: Math.sign(dx), y: Math.sign(dy) };
+      }
+      const cx = head.x * cellSize + cellSize / 2, cy = head.y * cellSize + cellSize / 2;
+      const sz = cellSize / 2 - 1;
+      ctx.beginPath();
+      if (dir.x === 1 && dir.y === 0) { ctx.moveTo(cx + sz, cy); ctx.lineTo(cx - sz, cy - sz); ctx.lineTo(cx - sz, cy + sz); }
+      else if (dir.x === -1 && dir.y === 0) { ctx.moveTo(cx - sz, cy); ctx.lineTo(cx + sz, cy - sz); ctx.lineTo(cx + sz, cy + sz); }
+      else if (dir.y === -1) { ctx.moveTo(cx, cy - sz); ctx.lineTo(cx - sz, cy + sz); ctx.lineTo(cx + sz, cy + sz); }
+      else { ctx.moveTo(cx, cy + sz); ctx.lineTo(cx - sz, cy - sz); ctx.lineTo(cx + sz, cy - sz); }
+      ctx.closePath(); ctx.fill();
+      ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    });
+
+    // Frame overlay on canvas
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, 140, 22);
+    ctx.fillStyle = '#0ff';
+    ctx.font = 'bold 13px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`Frame ${idx + 1} / ${rd.frames.length}`, 6, 4);
+    ctx.restore();
+
+    setPlayersRef.current([...(frame.players || [])]);
+    if (frame.matchTimeLeft != null) {
+      const min = Math.floor(frame.matchTimeLeft / 60);
+      const sec = frame.matchTimeLeft % 60;
+      setTimerRef.current(`${min}:${sec.toString().padStart(2, '0')}`);
+    }
+    setFrameLabelRef.current(`${idx + 1} / ${rd.frames.length}`);
+  }, []);
+
+  // Imperative stop: clears interval, updates state
+  const stopPlayback = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    setPlaying(false);
+  }, []);
+
+  // Imperative start: creates interval that advances frames
+  const startPlayback = useCallback(() => {
+    // Clear any existing interval first
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    setPlaying(true);
+    const ms = speedRef.current === 2 ? 62 : 125;
+    intervalRef.current = setInterval(() => {
+      const rd = replayRef.current;
+      if (!rd?.frames?.length) {
+        if (intervalRef.current) clearInterval(intervalRef.current);
+        intervalRef.current = null;
+        setPlaying(false);
+        return;
+      }
+      const nextIdx = frameIndexRef.current + 1;
+      if (nextIdx >= rd.frames.length) {
+        if (intervalRef.current) clearInterval(intervalRef.current);
+        intervalRef.current = null;
+        setPlaying(false);
+        return;
+      }
+      frameIndexRef.current = nextIdx;
+      drawFrame(nextIdx);
+    }, ms);
+  }, [drawFrame]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  const loadReplay = async (matchId: string) => {
+    if (!matchId.trim()) return;
+    stopPlayback();
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch(`/api/replay/${encodeURIComponent(matchId.trim())}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Replay not found');
+      }
+      const data = await res.json();
+      replayRef.current = data;
+      frameIndexRef.current = 0;
+      setReplayLoaded(true);
+      setMatchInfo(`${data.displayMatchId || '#' + data.matchId} — ${data.arenaId || ''}`);
+      setLoading(false);
+      // Draw first frame - call directly and also via rAF as backup
+      drawFrame(0);
+      requestAnimationFrame(() => drawFrame(0));
+    } catch (e: any) {
+      setError(e.message || 'Failed to load replay');
+      replayRef.current = null;
+      setReplayLoaded(false);
+      setLoading(false);
+    }
+  };
+
+  const handlePlay = () => startPlayback();
+  const handlePause = () => stopPlayback();
+  const handleStop = () => {
+    stopPlayback();
+    frameIndexRef.current = 0;
+    drawFrame(0);
+  };
+  const handleNextFrame = () => {
+    stopPlayback();
+    const rd = replayRef.current;
+    if (!rd?.frames?.length) return;
+    let idx = frameIndexRef.current + 1;
+    if (idx >= rd.frames.length) idx = rd.frames.length - 1;
+    frameIndexRef.current = idx;
+    drawFrame(idx);
+  };
+  const handleSpeedToggle = () => {
+    const s = speedRef.current === 1 ? 2 : 1;
+    speedRef.current = s;
+    setSpeed(s);
+    // If currently playing, restart with new speed
+    if (intervalRef.current) {
+      startPlayback();
+    }
+  };
+
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+
+  return (
+    <div className="content">
+      <aside className="left-panel">
+        <div className="panel-section">
+          <h3>🎬 Recent Matches</h3>
+          <ul className="fighter-list" style={{ maxHeight: '70vh', overflowY: 'auto' }}>
+            {replayList.map((r: any, i: number) => (
+              <li key={i} className="fighter-item alive" style={{ cursor: 'pointer' }} onClick={() => { setSearchInput(r.displayMatchId || String(r.matchId)); loadReplay(r.displayMatchId || String(r.matchId)); }}>
+                <span className="fighter-name">{r.displayMatchId || `#${r.matchId}`}</span>
+                <span className="fighter-length" style={{ fontSize: '11px' }}>{r.winner || 'No winner'}</span>
+              </li>
+            ))}
+            {replayList.length === 0 && <li className="fighter-item"><span className="muted">No replays yet</span></li>}
+          </ul>
+        </div>
+      </aside>
+
+      <div className="main-stage">
+        <h1 style={{ color: 'var(--neon-blue)' }}>🎬 REPLAY</h1>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            value={searchInput}
+            onChange={e => setSearchInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') loadReplay(searchInput); }}
+            placeholder="Match ID (e.g. P1400)"
+            style={{ padding: '6px 12px', background: '#111', border: '1px solid #333', color: '#fff', borderRadius: '6px', fontFamily: 'Orbitron, monospace', fontSize: '13px', width: '180px' }}
+          />
+          <button
+            onClick={() => loadReplay(searchInput)}
+            disabled={loading}
+            style={{ padding: '6px 16px', background: 'var(--neon-green)', color: '#000', border: 'none', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer', fontFamily: 'Orbitron, monospace', fontSize: '13px' }}
+          >
+            {loading ? '...' : 'Search'}
+          </button>
+        </div>
+        {error && <div style={{ color: '#ff4466', textAlign: 'center', marginBottom: '8px', fontSize: '13px' }}>{error}</div>}
+        {matchInfo && <div className="match-info">{matchInfo}</div>}
+        {replayLoaded && <div className="timer" style={{ color: '#ff8800' }}>{timer}</div>}
+        <div className="canvas-wrap">
+          <canvas ref={canvasRef} width={600 * dpr} height={600 * dpr}
+            style={{ width: 'min(600px, 90vw, 70vh)', height: 'min(600px, 90vw, 70vh)', border: '4px solid var(--neon-blue)', background: '#000' }} />
+        </div>
+        {replayLoaded && (
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button onClick={handleStop} style={controlBtnStyle} title="Stop (reset)">⏹</button>
+            <button onClick={playing ? handlePause : handlePlay} style={controlBtnStyle} title={playing ? 'Pause' : 'Play'}>
+              {playing ? '⏸' : '▶️'}
+            </button>
+            <button onClick={handleNextFrame} style={controlBtnStyle} title="Next frame">⏭</button>
+            <button onClick={handleSpeedToggle} style={{ ...controlBtnStyle, minWidth: '48px', fontSize: '12px' }} title="Toggle speed">
+              {speed}x
+            </button>
+            <span style={{ color: '#888', fontFamily: 'Orbitron, monospace', fontSize: '12px' }}>{frameLabel}</span>
+          </div>
+        )}
+      </div>
+
+      <aside className="right-panel">
+        <div className="panel-section">
+          <h3>⚔️ Fighters</h3>
+          <ul className="fighter-list">
+            {[...players].sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p: any, i: number) => (
+              <li key={i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
+                <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
+                <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
+              </li>
+            ))}
+            {players.length === 0 && <li className="fighter-item"><span className="muted">Load a replay</span></li>}
+          </ul>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+const controlBtnStyle: React.CSSProperties = {
+  padding: '6px 12px',
+  background: '#222',
+  color: '#fff',
+  border: '1px solid #444',
+  borderRadius: '6px',
+  cursor: 'pointer',
+  fontSize: '16px',
+  fontFamily: 'Orbitron, monospace',
+};
+
 function App() {
   const [, setMatchId] = useState<number | null>(null);
   const [displayMatchId, setDisplayMatchId] = useState<string | null>(null);
@@ -1911,7 +2346,7 @@ function App() {
   const [players, setPlayers] = useState<any[]>([]);
   const [perfLeaderboard, setPerfLeaderboard] = useState<any[]>([]);
   const [compLeaderboard, setCompLeaderboard] = useState<any[]>([]);
-  const [activePage, setActivePage] = useState<'performance' | 'competitive' | 'leaderboard' | 'points' | 'marketplace' | 'portfolio'>('performance');
+  const [activePage, setActivePage] = useState<'performance' | 'competitive' | 'leaderboard' | 'points' | 'marketplace' | 'portfolio' | 'replay'>('performance');
 
   const playersRef = useRef<any[]>([]);
   const lastPlayersUpdate = useRef(0);
@@ -1940,7 +2375,9 @@ function App() {
     }
   }).current;
 
+  const needsLeaderboard = activePage === 'leaderboard' || activePage === 'performance' || activePage === 'competitive';
   useEffect(() => {
+    if (!needsLeaderboard) return;
     const load = async () => {
       try {
         const [perfRes, compRes] = await Promise.all([
@@ -1954,7 +2391,7 @@ function App() {
     load();
     const t = setInterval(load, 30000);
     return () => clearInterval(t);
-  }, []);
+  }, [needsLeaderboard]);
 
   const isCompetitive = activePage === 'competitive';
 
@@ -1975,6 +2412,7 @@ function App() {
               <button className={`tab ${activePage === 'leaderboard' ? 'active' : ''}`} onClick={() => switchPage('leaderboard')}>🏆 排行榜</button>
               <button className={`tab ${activePage === 'points' ? 'active' : ''}`} onClick={() => switchPage('points')}>⭐ 积分</button>
               <button className={`tab ${activePage === 'marketplace' ? 'active' : ''}`} onClick={() => switchPage('marketplace')}>🏪 市场</button>
+              <button className={`tab ${activePage === 'replay' ? 'active' : ''}`} onClick={() => switchPage('replay')}>🎬 回放</button>
               <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <PortfolioButton activePage={activePage} onSwitch={switchPage} />
                 <WalletButton />
@@ -2020,6 +2458,8 @@ function App() {
               <MarketplacePage />
             ) : activePage === 'portfolio' ? (
               <PortfolioPage />
+            ) : activePage === 'replay' ? (
+              <ReplayPage />
             ) : (
               <div className={`content`}>
                 <aside className="left-panel">
@@ -2052,10 +2492,10 @@ function App() {
                   <div className="panel-section">
                     <h3>⚔️ Fighters</h3>
                     <ul className="fighter-list">
-                      {[...players].sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p, i) => (
-                        <li key={i} className={`fighter-item ${p.waiting ? 'alive' : (p.alive ? 'alive' : 'dead')}`}>
-                          <span className="fighter-name" style={{ color: p.color }}>{p.name}{p.waiting ? ' (waiting)' : ''}</span>
-                          <span className="fighter-length">{p.body?.length || 0} {p.waiting ? '⏳' : (p.alive ? '🐍' : '💀')}</span>
+                      {[...players].filter(p => !p.waiting).sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p, i) => (
+                        <li key={i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
+                          <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
+                          <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
                         </li>
                       ))}
                     </ul>

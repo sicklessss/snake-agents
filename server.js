@@ -5,6 +5,14 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const compression = require('compression');
+const zlib = require('zlib');
+
+// --- Data directory (separate from code to avoid accidental deletion during deploy) ---
+const DATA_DIR = process.env.DATA_DIR || '/root/snake-data';
+const REPLAY_DIR = path.join(DATA_DIR, 'replays');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(REPLAY_DIR)) fs.mkdirSync(REPLAY_DIR, { recursive: true });
 const { Worker } = require('worker_threads');
 
 // --- Blockchain Config ---
@@ -21,7 +29,7 @@ const CONTRACTS = {
 };
 
 // Backend wallet for creating bots on-chain
-const provider = new ethers.JsonRpcProvider('https://sepolia.base.org');
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL || 'https://sepolia.base.org');
 const backendWallet = process.env.BACKEND_PRIVATE_KEY 
     ? new ethers.Wallet(process.env.BACKEND_PRIVATE_KEY, provider)
     : null;
@@ -71,6 +79,24 @@ setInterval(() => {
         if (data.expires < now) editTokens.delete(token);
     }
 }, 3600_000);
+
+// Simple TTL cache for on-chain reads (avoids N+1 RPC calls per API request)
+const onChainCache = new Map(); // key -> { data, expires }
+function cachedCall(key, ttlMs, fn) {
+    const cached = onChainCache.get(key);
+    if (cached && cached.expires > Date.now()) return Promise.resolve(cached.data);
+    return fn().then(data => {
+        onChainCache.set(key, { data, expires: Date.now() + ttlMs });
+        return data;
+    });
+}
+// Evict expired cache entries every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of onChainCache.entries()) {
+        if (v.expires < now) onChainCache.delete(k);
+    }
+}, 300_000);
 
 const REFERRAL_REWARDS_ABI = [
     "function claim(uint256 amount, uint256 nonce, bytes calldata signature) external",
@@ -191,7 +217,7 @@ const MAX_WORKERS = 300;
 const activeWorkers = new Map(); // botId -> Worker instance
 
 // --- Referral System Config ---
-const REFERRAL_DATA_FILE = path.join(__dirname, 'data', 'referrals.json');
+const REFERRAL_DATA_FILE = path.join(DATA_DIR, 'referrals.json');
 const REFERRAL_POINTS_L1 = 100; // 100 points per direct referral
 const REFERRAL_POINTS_L2 = 50;  // 50 points per L2 referral
 
@@ -220,34 +246,9 @@ function saveReferralData() {
 }
 loadReferralData();
 
-// --- Points System ---
-const POINTS_DATA_FILE = path.join(__dirname, 'data', 'points.json');
-let pointsData = {}; // { walletAddress: { points: 0, history: [] } }
-function loadPoints() {
-    try {
-        if (fs.existsSync(POINTS_DATA_FILE)) {
-            pointsData = JSON.parse(fs.readFileSync(POINTS_DATA_FILE, 'utf8'));
-            log.info(`[Points] Loaded ${Object.keys(pointsData).length} point records`);
-        }
-    } catch (e) {
-        log.error('[Points] Failed to load data:', e.message);
-    }
-}
-function savePoints() {
-    try {
-        const dataDir = path.dirname(POINTS_DATA_FILE);
-        if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-        fs.writeFile(POINTS_DATA_FILE, JSON.stringify(pointsData, null, 2), (err) => {
-            if (err) log.error('[Points] Failed to save data:', err.message);
-        });
-    } catch (e) {
-        log.error('[Points] Failed to save data:', e.message);
-    }
-}
-loadPoints();
 
-// --- Airdrop Points System (accumulate-only, separate from betting balance) ---
-const AIRDROP_DATA_FILE = path.join(__dirname, 'data', 'airdrop-points.json');
+// --- Score System (accumulate-only, separate from betting balance) ---
+const SCORE_DATA_FILE = path.join(DATA_DIR, 'score.json');
 const CHECKIN_BASE = 10;
 const CHECKIN_STREAK_BONUS = 30; // day 7 bonus
 const MATCH_PARTICIPATE_POINTS = 5;
@@ -258,51 +259,51 @@ const REGISTER_BONUS = 200;
 const DAILY_MATCH_CAP = 20;
 const DAILY_BET_CAP = 50;
 
-let airdropPoints = {}; // { address: { total, checkin: { lastDate, streak }, history: [] } }
+let userScores = {}; // { address: { total, checkin: { lastDate, streak }, history: [] } }
 
-function loadAirdropPoints() {
+function loadScores() {
     try {
-        if (fs.existsSync(AIRDROP_DATA_FILE)) {
-            airdropPoints = JSON.parse(fs.readFileSync(AIRDROP_DATA_FILE, 'utf8'));
-            log.info(`[Airdrop] Loaded ${Object.keys(airdropPoints).length} airdrop point records`);
+        if (fs.existsSync(SCORE_DATA_FILE)) {
+            userScores = JSON.parse(fs.readFileSync(SCORE_DATA_FILE, 'utf8'));
+            log.info(`[Score] Loaded ${Object.keys(userScores).length} score records`);
         }
     } catch (e) {
-        log.error('[Airdrop] Failed to load data:', e.message);
+        log.error('[Score] Failed to load data:', e.message);
     }
 }
 
-function saveAirdropPoints() {
+function saveScores() {
     try {
-        const dataDir = path.dirname(AIRDROP_DATA_FILE);
+        const dataDir = path.dirname(SCORE_DATA_FILE);
         if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-        fs.writeFile(AIRDROP_DATA_FILE, JSON.stringify(airdropPoints, null, 2), (err) => {
-            if (err) log.error('[Airdrop] Failed to save data:', err.message);
+        fs.writeFile(SCORE_DATA_FILE, JSON.stringify(userScores, null, 2), (err) => {
+            if (err) log.error('[Score] Failed to save data:', err.message);
         });
     } catch (e) {
-        log.error('[Airdrop] Failed to save data:', e.message);
+        log.error('[Score] Failed to save data:', e.message);
     }
 }
 
-loadAirdropPoints();
+loadScores();
 
-function ensureAirdropUser(address) {
-    if (!airdropPoints[address]) {
-        airdropPoints[address] = { total: 0, checkin: { lastDate: null, streak: 0 }, history: [] };
+function ensureScoreUser(address) {
+    if (!userScores[address]) {
+        userScores[address] = { total: 0, checkin: { lastDate: null, streak: 0 }, history: [] };
     }
-    return airdropPoints[address];
+    return userScores[address];
 }
 
-function awardAirdropPoints(address, type, points, meta = {}) {
+function awardScore(address, type, points, meta = {}) {
     const addr = address.toLowerCase();
-    const user = ensureAirdropUser(addr);
+    const user = ensureScoreUser(addr);
     user.total += points;
     user.history.push({ type, points, ts: Date.now(), ...meta });
     // Keep only last 100 history entries
     if (user.history.length > 100) {
         user.history = user.history.slice(-100);
     }
-    saveAirdropPoints();
-    log.info(`[Airdrop] ${addr} +${points} (${type}) → total: ${user.total}`);
+    saveScores();
+    log.info(`[Score] ${addr} +${points} (${type}) → total: ${user.total}`);
 }
 
 function getUTCDate() {
@@ -311,7 +312,7 @@ function getUTCDate() {
 
 function getDailyCount(address, typePrefix) {
     const addr = address.toLowerCase();
-    const user = airdropPoints[addr];
+    const user = userScores[addr];
     if (!user) return 0;
     const today = getUTCDate();
     const startOfDay = new Date(today + 'T00:00:00Z').getTime();
@@ -335,40 +336,16 @@ function recordReferral(user, inviter, txHash, amount) {
         txHash: txHash
     };
 
-    // Award L1 referral points to inviter
-    if (!pointsData[inviterLower]) pointsData[inviterLower] = { points: 0, history: [] };
-    pointsData[inviterLower].points += REFERRAL_POINTS_L1;
-    pointsData[inviterLower].history.push({
-        type: 'referral_l1',
-        from: userLower,
-        points: REFERRAL_POINTS_L1,
-        timestamp: Date.now(),
-        txHash: txHash
-    });
+    // Award score for referrals
+    awardScore(inviterLower, 'referral_l1', REFERRAL_POINTS_L1, { from: userLower });
 
-    // L2 referral (inviter's inviter) — award points
+    // L2 referral (inviter's inviter)
     const l2Inviter = referralData.users[inviterLower]?.inviter;
     if (l2Inviter) {
-        if (!pointsData[l2Inviter]) pointsData[l2Inviter] = { points: 0, history: [] };
-        pointsData[l2Inviter].points += REFERRAL_POINTS_L2;
-        pointsData[l2Inviter].history.push({
-            type: 'referral_l2',
-            from: userLower,
-            via: inviterLower,
-            points: REFERRAL_POINTS_L2,
-            timestamp: Date.now(),
-            txHash: txHash
-        });
-    }
-
-    // Also award airdrop points for referrals
-    awardAirdropPoints(inviterLower, 'referral_l1', REFERRAL_POINTS_L1, { from: userLower });
-    if (l2Inviter) {
-        awardAirdropPoints(l2Inviter, 'referral_l2', REFERRAL_POINTS_L2, { from: userLower, via: inviterLower });
+        awardScore(l2Inviter, 'referral_l2', REFERRAL_POINTS_L2, { from: userLower, via: inviterLower });
     }
 
     saveReferralData();
-    savePoints();
     log.important(`[Referral] ${userLower} invited by ${inviterLower}, awarded ${REFERRAL_POINTS_L1} points (L1)`);
     return true;
 }
@@ -377,18 +354,18 @@ function recordReferral(user, inviter, txHash, amount) {
 function getReferralStats(address) {
     const addrLower = address.toLowerCase();
     const user = referralData.users[addrLower];
-    const userPoints = pointsData[addrLower] || { points: 0, history: [] };
+    const userScore = userScores[addrLower] || { total: 0, history: [] };
 
     // Count invitees
     const invitees = Object.entries(referralData.users)
         .filter(([_, data]) => data.inviter === addrLower)
         .map(([addr, data]) => ({ address: addr, registeredAt: data.registeredAt }));
 
-    // Sum referral points from history
-    const referralPointsL1 = userPoints.history
+    // Sum referral points from score history
+    const referralPointsL1 = userScore.history
         .filter(h => h.type === 'referral_l1')
         .reduce((sum, h) => sum + (h.points || 0), 0);
-    const referralPointsL2 = userPoints.history
+    const referralPointsL2 = userScore.history
         .filter(h => h.type === 'referral_l2')
         .reduce((sum, h) => sum + (h.points || 0), 0);
 
@@ -403,7 +380,7 @@ function getReferralStats(address) {
             l2Points: referralPointsL2,
             totalPoints: referralPointsL1 + referralPointsL2
         },
-        history: userPoints.history.filter(h => h.type === 'referral_l1' || h.type === 'referral_l2')
+        history: userScore.history.filter(h => h.type === 'referral_l1' || h.type === 'referral_l2')
     };
 }
 
@@ -510,12 +487,33 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.static(path.join(__dirname, 'public'), {
+app.use(compression());
+// Serve pre-compressed .gz files for assets (skip on-the-fly compression)
+app.use('/assets', (req, res, next) => {
+    const acceptEncoding = req.headers['accept-encoding'] || '';
+    if (acceptEncoding.includes('gzip')) {
+        const gzPath = path.join(__dirname, 'dist', 'assets', req.path + '.gz');
+        if (fs.existsSync(gzPath)) {
+            res.setHeader('Content-Encoding', 'gzip');
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            if (req.path.endsWith('.js')) res.setHeader('Content-Type', 'application/javascript');
+            else if (req.path.endsWith('.css')) res.setHeader('Content-Type', 'text/css');
+            return res.sendFile(gzPath);
+        }
+    }
+    next();
+});
+app.use(express.static(path.join(__dirname, 'dist'), {
     setHeaders: (res, filePath) => {
-        // Prevent browser from caching stale assets
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        res.setHeader('Pragma', 'no-cache');
-        res.setHeader('Expires', '0');
+        if (filePath.includes('/assets/')) {
+            // Vite hashed assets — safe to cache for 1 year
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        } else {
+            // index.html and other root files — always revalidate
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+        }
     }
 }));
 app.use(express.json({ limit: '200kb' }));
@@ -534,7 +532,7 @@ app.use((req, res, next) => {
 app.use('/api', rateLimit({ windowMs: 60_000, max: 120 }));
 
 // --- Global History ---
-const HISTORY_FILE = 'history.json';
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 let matchHistory = [];
 let matchNumber = 0;
 if (fs.existsSync(HISTORY_FILE)) {
@@ -553,7 +551,7 @@ function nextMatchId() {
 }
 
 // Per-type display counters (persisted, reset daily at UTC midnight)
-const COUNTERS_FILE = 'match_counters.json';
+const COUNTERS_FILE = path.join(DATA_DIR, 'match_counters.json');
 let perfMatchCounter = 1;
 let compMatchCounter = 1;
 let lastResetDate = new Date().toISOString().slice(0, 10);
@@ -674,7 +672,7 @@ function checkDailyReset() {
 }
 setInterval(checkDailyReset, 60_000);
 
-function saveHistory(arenaId, winnerName, score, winnerId) {
+function saveHistory(arenaId, winnerName, score, winnerId, participants) {
     matchHistory.unshift({
         matchId: nextMatchId(),
         arenaId,
@@ -682,6 +680,7 @@ function saveHistory(arenaId, winnerName, score, winnerId) {
         winner: winnerName,
         winnerId: winnerId || null,
         score: score,
+        participants: participants || [],
     });
     // Keep last 500 matches
     if (matchHistory.length > 500) matchHistory = matchHistory.slice(0, 500);
@@ -837,7 +836,7 @@ function startBotWorker(botId, overrideArenaId) {
 }
 
 // --- Bot Registry (MVP, local JSON) ---
-const BOT_DB_FILE = path.join(__dirname, 'data', 'bots.json');
+const BOT_DB_FILE = path.join(DATA_DIR, 'bots.json');
 let botRegistry = {};
 
 function loadBotRegistry() {
@@ -1072,9 +1071,12 @@ class GameRoom {
                 }
                 Object.values(this.players).forEach(other => {
                     if (!other.body) return;
-                    other.body.forEach(seg => {
-                        if (seg.x >= 0 && seg.x < G && seg.y >= 0 && seg.y < G)
+                    other.body.forEach((seg, idx) => {
+                        if (seg.x >= 0 && seg.x < G && seg.y >= 0 && seg.y < G) {
+                            // Skip each snake's tail tip — it will be popped on next move (unless eating food)
+                            if (other.alive && idx === other.body.length - 1) return;
                             grid[seg.y][seg.x] = 1;
+                        }
                     });
                 });
                 // Add solid obstacles
@@ -1479,7 +1481,10 @@ class GameRoom {
         this.gameState = 'GAMEOVER';
         this.winner = survivor ? survivor.name : 'No Winner';
         this.timerSeconds = 5;
-        saveHistory(this.id, this.winner, survivor ? survivor.score : 0);
+        const participants = Object.values(this.players)
+            .filter(p => p.botId && !p.id.startsWith('normal_'))
+            .map(p => p.name);
+        saveHistory(this.id, this.winner, survivor ? survivor.score : 0, null, participants);
 
         // Save replay
         this.saveReplay(survivor);
@@ -1512,6 +1517,17 @@ class GameRoom {
             const onChainMatchId = this.currentMatchId;
             const winnerBytes32Array = placements.map(botId => ethers.encodeBytes32String(botId));
             enqueueTx(`settleMatch ${onChainMatchId}`, async (overrides) => {
+                // Wait for startTime to pass (avoid "Match not started" if createMatch was slow)
+                try {
+                    const matchData = await pariMutuelContract.matches(onChainMatchId);
+                    const startTime = Number(matchData.startTime || 0);
+                    const now = Math.floor(Date.now() / 1000);
+                    if (startTime > now) {
+                        const waitSec = startTime - now + 2;
+                        log.info(`[Blockchain] settleMatch #${onChainMatchId}: waiting ${waitSec}s for startTime`);
+                        await new Promise(r => setTimeout(r, waitSec * 1000));
+                    }
+                } catch (e) { /* match may not exist yet, settle will fail and retry */ }
                 const tx = await pariMutuelContract.settleMatch(onChainMatchId, winnerBytes32Array, overrides);
                 await tx.wait();
                 log.important(`[Blockchain] settleMatch #${onChainMatchId} settled with ${placements.length} winner(s): ${placements.join(', ')}`);
@@ -1520,55 +1536,7 @@ class GameRoom {
             });
         }
 
-        // Settle bets using points (server-side pari-mutuel)
-        this._settledBets = []; // store for airdrop calculation
-        if (placements.length > 0) {
-            const matchId = this.currentMatchId;
-            const arenaType = this.type;
-            const winnerBotId = placements[0]; // 1st place bot name
-            const bets = betRecords[matchId] || [];
-            if (bets.length > 0) {
-                // Save all bets for airdrop points (before cleanup)
-                this._settledBets = bets.map(b => ({ ...b, winnings: 0 }));
-
-                const totalPool = bets.reduce((s, b) => s + b.amount, 0);
-                const winnerBets = bets.filter(b => b.botId === winnerBotId);
-                const winnerPool = winnerBets.reduce((s, b) => s + b.amount, 0);
-
-                if (winnerPool > 0 && totalPool > 0) {
-                    // Pari-mutuel: winners split the entire pool proportionally
-                    let totalAwarded = 0;
-                    for (const bet of winnerBets) {
-                        if (!bet.bettor || bet.bettor === 'anonymous') continue;
-                        const addr = bet.bettor.toLowerCase();
-                        const winnings = Math.floor(totalPool * (bet.amount / winnerPool));
-                        if (winnings > 0) {
-                            if (!pointsData[addr]) pointsData[addr] = { points: 0, history: [] };
-                            pointsData[addr].points += winnings;
-                            pointsData[addr].history.push({
-                                matchId, amount: winnings, type: 'bet_win', botId: winnerBotId, ts: Date.now()
-                            });
-                            totalAwarded += winnings;
-                            // Tag settled bet with winnings for airdrop calculation
-                            const settledBet = this._settledBets.find(sb => sb.bettor === addr && sb.botId === winnerBotId);
-                            if (settledBet) settledBet.winnings = winnings;
-                        }
-                    }
-                    if (totalAwarded > 0) {
-                        savePoints();
-                        log.important(`[Betting] Match #${matchId} (${arenaType}) settled. Winner: ${winnerBotId}. Pool: ${totalPool}, awarded: ${totalAwarded} points to ${winnerBets.length} winner(s)`);
-                    }
-                } else {
-                    // No one bet on the winner — all bets are lost (points already deducted)
-                    log.important(`[Betting] Match #${matchId} (${arenaType}). Winner: ${winnerBotId}. No winning bets. Pool of ${totalPool} points forfeited.`);
-                }
-                // Clean up settled records
-                delete betRecords[matchId];
-                delete betPools[matchId];
-            }
-        }
-
-        // --- Airdrop points: match participation & placements ---
+        // --- Score: match participation & placements ---
         const matchId = this.currentMatchId;
         const arenaType = this.type;
         const allBotsInMatch = allPlayers.filter(p => p.botId);
@@ -1577,9 +1545,8 @@ class GameRoom {
             const ownerAddr = botRegistry[p.botId]?.owner;
             if (!ownerAddr || ownerAddr === 'unknown' || ownersAwarded.has(ownerAddr)) continue;
             ownersAwarded.add(ownerAddr);
-            // Check daily match cap
             if (getDailyCount(ownerAddr, 'match_') < DAILY_MATCH_CAP) {
-                awardAirdropPoints(ownerAddr, 'match_participate', MATCH_PARTICIPATE_POINTS, { matchId, botId: p.botId });
+                awardScore(ownerAddr, 'match_participate', MATCH_PARTICIPATE_POINTS, { matchId, botId: p.botId });
             }
         }
 
@@ -1589,34 +1556,7 @@ class GameRoom {
                 const botId = placements[i];
                 const ownerAddr = botRegistry[botId]?.owner;
                 if (!ownerAddr || ownerAddr === 'unknown') continue;
-                awardAirdropPoints(ownerAddr, 'match_place', MATCH_PLACE_REWARDS[i], { matchId, botId, place: i + 1 });
-            }
-        }
-
-        // --- Airdrop points: bet activity & bet winnings ---
-        const settledBets = this._settledBets || [];
-        const bettorsAwarded = new Set();
-        for (const bet of settledBets) {
-            if (!bet.bettor || bet.bettor === 'anonymous') continue;
-            const addr = bet.bettor.toLowerCase();
-            if (!bettorsAwarded.has(addr)) {
-                bettorsAwarded.add(addr);
-                if (getDailyCount(addr, 'bet_') < DAILY_BET_CAP) {
-                    const betPts = Math.max(1, Math.floor(parseFloat(bet.amount) || 1));
-                    awardAirdropPoints(addr, 'bet_activity', betPts, { matchId });
-                }
-            }
-        }
-        // Bet win airdrop bonus
-        for (const bet of settledBets) {
-            if (!bet.bettor || bet.bettor === 'anonymous' || !bet.winnings || bet.winnings <= 0) continue;
-            const addr = bet.bettor.toLowerCase();
-            const profit = bet.winnings - bet.amount;
-            if (profit > 0) {
-                const bonus = Math.floor(profit * BET_WIN_MULTIPLIER);
-                if (bonus > 0) {
-                    awardAirdropPoints(addr, 'bet_win', bonus, { matchId, winnings: bet.winnings });
-                }
+                awardScore(ownerAddr, 'match_place', MATCH_PLACE_REWARDS[i], { matchId, botId, place: i + 1 });
             }
         }
     }
@@ -1626,6 +1566,7 @@ class GameRoom {
         
         const replay = {
             matchId: this.currentMatchId,
+            displayMatchId: this.displayMatchId,
             arenaId: this.id,
             arenaType: this.type,
             gridSize: CONFIG.gridSize,
@@ -1637,16 +1578,31 @@ class GameRoom {
         };
         
         // Ensure replays directory exists
-        const replayDir = path.join(__dirname, 'replays');
+        const replayDir = REPLAY_DIR;
         if (!fs.existsSync(replayDir)) {
             fs.mkdirSync(replayDir, { recursive: true });
         }
         
-        const filename = `match-${this.currentMatchId}.json`;
-        fs.writeFile(path.join(replayDir, filename), JSON.stringify(replay), (err) => {
-            if (err) log.error('[Replay] Failed to save:', err.message);
+        const filename = `match-${this.currentMatchId}.json.gz`;
+        const jsonBuf = Buffer.from(JSON.stringify(replay));
+        zlib.gzip(jsonBuf, (err, compressed) => {
+            if (err) { log.error('[Replay] Gzip failed:', err.message); return; }
+            fs.writeFile(path.join(replayDir, filename), compressed, (err2) => {
+                if (err2) log.error('[Replay] Failed to save:', err2.message);
+            });
         });
         log.info(`[Replay] Saved ${filename} (${this.replayFrames.length} frames)`);
+
+        // Add to lightweight replay index
+        addToReplayIndex({
+            matchId: this.currentMatchId,
+            displayMatchId: this.displayMatchId,
+            arenaId: this.id,
+            timestamp: replay.timestamp,
+            winner: this.winner,
+            winnerScore: survivor ? survivor.score : 0,
+            totalFrames: this.replayFrames.length,
+        });
         
         // Clear frames for next match
         this.replayFrames = [];
@@ -1682,11 +1638,11 @@ class GameRoom {
         });
         this.waitingRoom = preserved;
 
-        // Enforce maxPlayers cap on next match
+        // Enforce maxPlayers cap on next match (competitive allows up to 20 for paid entries)
+        const cap = this.type === 'competitive' ? 20 : this.maxPlayers;
         const allIds = Object.keys(this.waitingRoom);
-        if (allIds.length > this.maxPlayers) {
-            // Remove normals first, then random until within cap
-            let overflow = allIds.length - this.maxPlayers;
+        if (allIds.length > cap) {
+            let overflow = allIds.length - cap;
             const normals = allIds.filter(id => this.waitingRoom[id].botType === 'normal');
             while (overflow > 0 && normals.length > 0) {
                 const victimId = normals.pop();
@@ -1711,8 +1667,8 @@ class GameRoom {
         if (pariMutuelContract) {
             const onChainMatchId = this.currentMatchId;
             enqueueTx(`createMatch ${onChainMatchId}`, async (overrides) => {
-                // Calculate startTime at execution time (not enqueue time) to avoid "Start time must be in future"
-                const startTime = Math.floor(Date.now() / 1000) + 30;
+                // Use minimal future offset to avoid "Match not started" race with settleMatch
+                const startTime = Math.floor(Date.now() / 1000) + 5;
                 const tx = await pariMutuelContract.createMatch(onChainMatchId, startTime, overrides);
                 await tx.wait();
                 log.important(`[Blockchain] createMatch #${onChainMatchId} (startTime=${startTime}) confirmed`);
@@ -1865,7 +1821,7 @@ class GameRoom {
             victoryPauseTime: Math.ceil(this.victoryPauseTimer / 8),
         };
 
-        // Record frame for replay (only during PLAYING)
+        // Record frame for replay (only during PLAYING) — deep copy mutable data
         if (this.gameState === 'PLAYING' && this.replayFrames.length < 2000) {
             this.replayFrames.push({
                 turn: this.turn,
@@ -1874,13 +1830,13 @@ class GameRoom {
                     id: p.id,
                     name: p.name,
                     color: p.color,
-                    body: p.body,
+                    body: p.body.map(s => ({ x: s.x, y: s.y })),
                     score: p.score,
                     alive: p.alive,
                     botType: p.botType,
                 })),
-                food: this.food,
-                obstacles: this.type === 'competitive' ? this.obstacles.filter(o => o.solid || o.blinkTimer > 0) : [],
+                food: this.food.map(f => ({ x: f.x, y: f.y })),
+                obstacles: this.type === 'competitive' ? this.obstacles.filter(o => o.solid || o.blinkTimer > 0).map(o => ({ x: o.x, y: o.y, solid: o.solid })) : [],
             });
         }
 
@@ -2062,15 +2018,27 @@ function autoFillCompetitiveRoom(room) {
     
     // Check paid entries for this match (keyed by displayMatchId string)
     const paidForMatch = room.paidEntries[room.displayMatchId] || [];
-    
-    // Add paid entries first
+
+    // Temporarily expand room capacity based on paid entries (max 20)
+    const effectiveMax = Math.min(Math.max(room.maxPlayers, paidForMatch.length), 20);
+
+    // Add paid entries first — kick normal bots if needed to make room
     for (const botId of paidForMatch) {
         if (currentBotIds.has(botId)) continue;
-        if (Object.keys(room.waitingRoom).length >= room.maxPlayers) break;
-        
+
         const meta = botRegistry[botId];
         if (!meta || meta.botType !== 'agent') continue;
-        
+
+        // If room is full at expanded capacity, kick a normal bot
+        if (Object.keys(room.waitingRoom).length >= effectiveMax) {
+            const normalVictim = Object.keys(room.waitingRoom).find(id => room.waitingRoom[id].botType === 'normal');
+            if (normalVictim) {
+                delete room.waitingRoom[normalVictim];
+            } else {
+                break; // No normals left to kick and at max capacity
+            }
+        }
+
         const id = 'comp_' + Math.random().toString(36).slice(2, 7);
         room.waitingRoom[id] = {
             id,
@@ -2099,19 +2067,18 @@ function autoFillCompetitiveRoom(room) {
         [agentBotIds[i], agentBotIds[j]] = [agentBotIds[j], agentBotIds[i]];
     }
     
-    // Replace normal bots with agents
+    // Replace normal bots with agents, then fill extra slots up to effectiveMax
     const normalIds = Object.keys(room.waitingRoom).filter(id => room.waitingRoom[id].botType === 'normal');
     let replaced = 0;
-    
+
     for (const botId of agentBotIds) {
-        if (replaced >= normalIds.length) break;
-        if (Object.keys(room.waitingRoom).length >= room.maxPlayers && normalIds.length <= replaced) break;
-        
-        // Kick a normal bot to make room
-        if (normalIds[replaced]) {
+        // First replace normals, then fill any extra expanded slots
+        if (replaced < normalIds.length) {
             delete room.waitingRoom[normalIds[replaced]];
+        } else if (Object.keys(room.waitingRoom).length >= effectiveMax) {
+            break; // No normals left and room is at expanded capacity
         }
-        
+
         const meta = botRegistry[botId];
         const id = 'comp_' + Math.random().toString(36).slice(2, 7);
         room.waitingRoom[id] = {
@@ -2168,7 +2135,7 @@ function countTotalAgents() {
 // --- Entry Fee System ---
 // Entry fee starts at 0.01 ETH, increases by 0.01 each time all 60 slots are filled
 let currentEntryFee = 0.01;
-const ENTRY_FEE_FILE = path.join(__dirname, 'data', 'entry-fee.json');
+const ENTRY_FEE_FILE = path.join(DATA_DIR, 'entry-fee.json');
 
 function loadEntryFee() {
     try {
@@ -2497,10 +2464,43 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
             saveBotRegistry();
         }
         log.important('[Register] Bot ' + botMeta.name + ' (' + botId + ') claimed via regCode by ' + (owner || 'unknown'));
-        return res.json({ ok: true, botId, name: botMeta.name });
+
+        // Ensure bot exists on-chain (same as non-regCode path)
+        let onChainOk = false;
+        if (botRegistryContract) {
+            const botIdBytes32 = ethers.encodeBytes32String(botId);
+            try {
+                const existing = await botRegistryContract.getBotById(botIdBytes32);
+                if (existing && existing.botId === botIdBytes32) {
+                    onChainOk = true;
+                }
+            } catch (e) { /* not on-chain yet */ }
+            if (!onChainOk) {
+                try {
+                    await enqueueTxAsync(`createBot ${botId}`, async (overrides) => {
+                        const tx = await botRegistryContract.createBot(
+                            botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides
+                        );
+                        await tx.wait(1, 60000);
+                        log.important(`[Blockchain] Bot ${botId} created on-chain via regCode claim`);
+                    });
+                    onChainOk = true;
+                } catch (err) {
+                    log.warn('[Blockchain] Failed to create bot on-chain via regCode:', err.message);
+                }
+            }
+        }
+
+        return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: onChainOk });
     }
 
     const safeName = (name || 'AgentBot').toString().slice(0, MAX_NAME_LEN);
+
+    // Prevent agents from accidentally using regCode as bot name
+    if (/^[0-9A-Fa-f]{6,8}$/.test(safeName)) {
+        return res.status(400).json({ error: 'invalid_name', message: 'Bot name "' + safeName + '" looks like a registration code. Please provide a descriptive bot name.' });
+    }
+
     const ownerAddr = (owner || 'unknown').toString().slice(0, 64).toLowerCase();
 
     // Check if bot with this name already exists (e.g. from upload)
@@ -2576,13 +2576,13 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         }
     }
 
-    // Award airdrop registration bonus (once per wallet)
+    // Award registration bonus (once per wallet)
     if (ownerAddr && ownerAddr !== 'unknown') {
-        const adUser = airdropPoints[ownerAddr];
+        const adUser = userScores[ownerAddr];
         const alreadyClaimed = adUser && adUser.history.some(h => h.type === 'register');
         if (!alreadyClaimed) {
-            awardAirdropPoints(ownerAddr, 'register', REGISTER_BONUS, {});
-            log.important(`[Airdrop] Registration bonus ${REGISTER_BONUS} awarded to ${ownerAddr}`);
+            awardScore(ownerAddr, 'register', REGISTER_BONUS, {});
+            log.important(`[Score] Registration bonus ${REGISTER_BONUS} awarded to ${ownerAddr}`);
         }
     }
 
@@ -2898,12 +2898,17 @@ app.post('/api/competitive/enter', async (req, res) => {
         return res.status(400).json({ error: 'tx_already_used', message: 'This transaction has already been used for entry' });
     }
 
-    // Verify transaction on-chain
+    // Verify transaction on-chain (retry up to 5 times — RPC load balancer may lag)
+    let receipt = null, tx = null;
     try {
-        const [receipt, tx] = await Promise.all([
-            provider.getTransactionReceipt(txHash),
-            provider.getTransaction(txHash),
-        ]);
+        for (let attempt = 0; attempt < 5; attempt++) {
+            [receipt, tx] = await Promise.all([
+                provider.getTransactionReceipt(txHash),
+                provider.getTransaction(txHash),
+            ]);
+            if (receipt && receipt.status === 1 && tx) break;
+            await new Promise(r => setTimeout(r, 2000));
+        }
         if (!receipt || receipt.status !== 1) {
             return res.status(400).json({ error: 'tx_not_confirmed', message: 'Transaction not confirmed on-chain' });
         }
@@ -2929,6 +2934,13 @@ app.post('/api/competitive/enter', async (req, res) => {
     const parseNum = (s) => parseInt(String(s).replace(/^[A-Za-z]+/, '')) || 0;
     if (parseNum(displayMatchId) < parseNum(room.displayMatchId)) {
         return res.status(400).json({ error: 'invalid_match', message: 'Match must be >= current ' + room.displayMatchId });
+    }
+
+    // Cap: max 20 paid entries per match
+    const MAX_PAID_PER_MATCH = 20;
+    const existingPaid = (room.paidEntries[displayMatchId] || []).length;
+    if (existingPaid >= MAX_PAID_PER_MATCH) {
+        return res.status(400).json({ error: 'match_full', message: 'This match already has ' + MAX_PAID_PER_MATCH + ' paid entries, room is full' });
     }
 
     // Record paid entry keyed by displayMatchId string
@@ -3138,8 +3150,9 @@ app.post('/api/bot/upload', rateLimit({ windowMs: 60_000, max: 10 }), async (req
             botId: targetBotId,
             name: botRegistry[targetBotId].name,
             owner: botRegistry[targetBotId].owner,
+            regCode: isNewBot ? botRegistry[targetBotId].regCode : undefined,
             running: botRegistry[targetBotId].running || false,
-            message: 'Bot uploaded and started successfully.'
+            message: 'Bot uploaded and started successfully.' + (isNewBot ? ' Use regCode to register on-chain and mint NFT.' : '')
         });
     } catch (e) {
         console.error(e);
@@ -3324,26 +3337,7 @@ app.post('/api/bot/claim-nft', async (req, res) => {
     }
 });
 
-// --- Betting ---
-const betPools = {}; // matchId -> { total: 0, bets: [] } (mirrors on-chain for fast reads)
-const betRecords = {}; // matchId -> [{bettor, botId, amount (USDC units)}] for points calculation
-
-// Clean up old bet pools/records every hour (keep last 24h)
-setInterval(() => {
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    for (const matchId of Object.keys(betPools)) {
-        const pool = betPools[matchId];
-        if (pool.bets && pool.bets.length > 0 && pool.bets[pool.bets.length - 1].timestamp < cutoff) {
-            delete betPools[matchId];
-        }
-    }
-    for (const matchId of Object.keys(betRecords)) {
-        const records = betRecords[matchId];
-        if (records && records.length > 0 && records[records.length - 1].timestamp < cutoff) {
-            delete betRecords[matchId];
-        }
-    }
-}, 3600_000);
+// --- Betting (on-chain USDC via PariMutuel contract) ---
 
 // Get on-chain pool info for a match
 app.get('/api/bet/pool', async (req, res) => {
@@ -3533,145 +3527,21 @@ app.get('/api/portfolio', async (req, res) => {
     res.json({ activePositions, betHistory, claimable, claimableTotal });
 });
 
-const handleBetPlace = (req, res) => {
-    const { matchId, botId, amount, bettor, arenaType, signature, timestamp } = req.body || {};
-
-    if (!matchId || !botId || !amount) {
-        return res.status(400).json({ error: 'Missing required fields: matchId, botId, amount' });
-    }
-    if (!bettor || bettor === 'anonymous') {
-        return res.status(400).json({ error: 'Please connect wallet to place a bet' });
-    }
-
-    // Require signature for bettor verification
-    if (!signature || !timestamp) {
-        return res.status(401).json({ error: 'Signature required for predictions' });
-    }
-    {
-        const ts = parseInt(timestamp);
-        if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
-            return res.status(401).json({ error: 'Signature expired' });
-        }
-        const message = `Snake Agents Bet\nAddress: ${bettor}\nMatch: ${matchId}\nBot: ${botId}\nAmount: ${amount}\nTimestamp: ${timestamp}`;
-        try {
-            const recovered = ethers.verifyMessage(message, signature);
-            if (recovered.toLowerCase() !== bettor.toLowerCase()) {
-                return res.status(401).json({ error: 'Invalid signature — bettor mismatch' });
-            }
-        } catch (e) {
-            return res.status(401).json({ error: 'Invalid signature' });
-        }
-    }
-
-    const betAmount = Math.floor(Number(amount));
-    if (isNaN(betAmount) || betAmount <= 0) {
-        return res.status(400).json({ error: 'Invalid amount (must be positive integer)' });
-    }
-
-    // Check if bettor has enough points
-    const addr = bettor.toLowerCase();
-    const userData = pointsData[addr] || { points: 0, history: [] };
-    if (userData.points < betAmount) {
-        return res.status(400).json({ error: `Insufficient points. You have ${userData.points}, need ${betAmount}` });
-    }
-
-    // Deduct points from bettor
-    if (!pointsData[addr]) pointsData[addr] = { points: 0, history: [] };
-    pointsData[addr].points -= betAmount;
-    pointsData[addr].history.push({
-        type: 'bet_place', matchId: Number(matchId), amount: -betAmount, botId, ts: Date.now()
-    });
-    if (pointsData[addr].history.length > 200) {
-        pointsData[addr].history = pointsData[addr].history.slice(-200);
-    }
-    savePoints();
-
-    // Initialize pool for this match if not exists
-    if (!betPools[matchId]) {
-        betPools[matchId] = { total: 0, bets: [] };
-    }
-
-    // Record the bet
-    betPools[matchId].bets.push({
-        botId,
-        amount: betAmount,
-        bettor: addr,
-        arenaType: arenaType || null,
-        timestamp: Date.now()
-    });
-    betPools[matchId].total += betAmount;
-
-    // Also record in betRecords for settlement
-    if (!betRecords[matchId]) betRecords[matchId] = [];
-    betRecords[matchId].push({
-        bettor: addr,
-        botId,
-        amount: betAmount,
-        arenaType: arenaType || null,
-        timestamp: Date.now()
-    });
-
-    console.log(`[Prediction] ${addr} bet ${betAmount} points on "${botId}" for match #${matchId} (${arenaType || 'unknown'})`);
-
-    res.json({
-        ok: true,
-        total: betPools[matchId].total,
-        matchId,
-        yourBet: { botId, amount: betAmount },
-        remainingPoints: pointsData[addr].points
-    });
-};
-
-const handleBetStatus = (req, res) => {
-    const matchId = req.query.matchId;
-    if (!matchId || !betPools[matchId]) return res.json({ total: 0, bets: [] });
-    res.json(betPools[matchId]);
-};
-
-app.post('/api/bet/place', handleBetPlace);
-app.get('/api/bet/status', handleBetStatus);
-// Prediction aliases (same handlers, new naming)
-app.post('/api/prediction/place', handleBetPlace);
-app.get('/api/prediction/status', handleBetStatus);
-
-app.post('/api/bet/claim', (req, res) => {
-    res.json({ ok: true });
-});
-
-// --- Points API ---
-app.get('/api/points/my', (req, res) => {
-    const { address } = req.query;
-    if (!address) return res.status(400).json({ error: 'missing address' });
+// Award score when user places an on-chain USDC bet (called by frontend after tx confirms)
+app.post('/api/score/bet', (req, res) => {
+    const { address, amount, matchId, botId } = req.body || {};
+    if (!address || !amount) return res.status(400).json({ error: 'missing address or amount' });
     const addr = address.toLowerCase();
-    const data = pointsData[addr] || { points: 0, history: [] };
-    // Include rank
-    const sorted = Object.entries(pointsData)
-        .sort(([, a], [, b]) => b.points - a.points);
-    const rank = sorted.findIndex(([a]) => a === addr) + 1;
-    res.json({
-        address: addr,
-        points: data.points,
-        rank: rank > 0 ? rank : null,
-        history: (data.history || []).slice(-20).reverse() // last 20, newest first
-    });
+    const pts = Math.max(1, Math.floor(parseFloat(amount) || 1));
+    awardScore(addr, 'bet_activity', pts, { matchId, botId });
+    const user = userScores[addr] || { total: 0 };
+    res.json({ ok: true, awarded: pts, total: user.total });
 });
 
-app.get('/api/points/leaderboard', (req, res) => {
-    const sorted = Object.entries(pointsData)
-        .sort(([, a], [, b]) => b.points - a.points)
-        .slice(0, 20)
-        .map(([address, data], idx) => ({
-            rank: idx + 1,
-            address,
-            points: data.points
-        }));
-    res.json(sorted);
-});
-
-// --- Airdrop Points APIs ---
+// --- Score APIs ---
 
 // Daily check-in (requires wallet signature)
-app.post('/api/airdrop/checkin', async (req, res) => {
+app.post('/api/score/checkin', async (req, res) => {
     const { address, signature, timestamp } = req.body || {};
     if (!address || !signature || !timestamp) {
         return res.status(400).json({ error: 'missing_params', message: 'address, signature, timestamp required' });
@@ -3689,7 +3559,7 @@ app.post('/api/airdrop/checkin', async (req, res) => {
     }
 
     const addr = address.toLowerCase();
-    const user = ensureAirdropUser(addr);
+    const user = ensureScoreUser(addr);
     const today = getUTCDate();
 
     // Already checked in today?
@@ -3713,7 +3583,7 @@ app.post('/api/airdrop/checkin', async (req, res) => {
         user.checkin.streak = 0; // reset after 7-day bonus
     }
 
-    awardAirdropPoints(addr, 'checkin', points, { streak: user.checkin.streak || 7 });
+    awardScore(addr, 'checkin', points, { streak: user.checkin.streak || 7 });
 
     res.json({
         ok: true,
@@ -3724,15 +3594,15 @@ app.post('/api/airdrop/checkin', async (req, res) => {
     });
 });
 
-// Get my airdrop points
-app.get('/api/airdrop/my', (req, res) => {
+// Get my score
+app.get('/api/score/my', (req, res) => {
     const { address } = req.query;
     if (!address) return res.status(400).json({ error: 'missing address' });
     const addr = address.toLowerCase();
-    const user = airdropPoints[addr] || { total: 0, checkin: { lastDate: null, streak: 0 }, history: [] };
+    const user = userScores[addr] || { total: 0, checkin: { lastDate: null, streak: 0 }, history: [] };
 
     // Include rank
-    const sorted = Object.entries(airdropPoints)
+    const sorted = Object.entries(userScores)
         .sort(([, a], [, b]) => b.total - a.total);
     const rank = sorted.findIndex(([a]) => a === addr) + 1;
 
@@ -3751,9 +3621,9 @@ app.get('/api/airdrop/my', (req, res) => {
     });
 });
 
-// Airdrop leaderboard
-app.get('/api/airdrop/leaderboard', (req, res) => {
-    const sorted = Object.entries(airdropPoints)
+// Score leaderboard
+app.get('/api/score/leaderboard', (req, res) => {
+    const sorted = Object.entries(userScores)
         .sort(([, a], [, b]) => b.total - a.total)
         .slice(0, 50)
         .map(([address, data], idx) => ({
@@ -3765,7 +3635,7 @@ app.get('/api/airdrop/leaderboard', (req, res) => {
 });
 
 // Claim registration bonus (requires wallet signature)
-app.post('/api/airdrop/claim-register', async (req, res) => {
+app.post('/api/score/claim-register', async (req, res) => {
     const { address, signature, timestamp } = req.body || {};
     if (!address || !signature || !timestamp) {
         return res.status(400).json({ error: 'missing_params', message: 'address, signature, timestamp required' });
@@ -3785,7 +3655,7 @@ app.post('/api/airdrop/claim-register', async (req, res) => {
     const addr = address.toLowerCase();
 
     // Check if already claimed
-    const user = airdropPoints[addr];
+    const user = userScores[addr];
     if (user && user.history.some(h => h.type === 'register')) {
         return res.status(400).json({ error: 'already_claimed', message: 'Registration bonus already claimed' });
     }
@@ -3796,52 +3666,137 @@ app.post('/api/airdrop/claim-register', async (req, res) => {
         return res.status(400).json({ error: 'no_bots', message: 'Register a bot first to claim the bonus' });
     }
 
-    awardAirdropPoints(addr, 'register', REGISTER_BONUS, {});
-    log.important(`[Airdrop] Registration bonus ${REGISTER_BONUS} claimed by ${addr}`);
+    awardScore(addr, 'register', REGISTER_BONUS, {});
+    log.important(`[Score] Registration bonus ${REGISTER_BONUS} claimed by ${addr}`);
 
     res.json({
         ok: true,
         points: REGISTER_BONUS,
-        total: airdropPoints[addr].total,
-        message: `Registration bonus of ${REGISTER_BONUS} airdrop points claimed!`
+        total: userScores[addr].total,
+        message: `Registration bonus of ${REGISTER_BONUS} points claimed!`
     });
 });
 
 // Replay APIs
-app.get('/api/replays', (req, res) => {
-    const replayDir = path.join(__dirname, 'replays');
-    if (!fs.existsSync(replayDir)) {
-        return res.json([]);
+// In-memory replay index (lightweight metadata, no frame data)
+const replayIndex = [];
+const replayIndexPath = path.join(DATA_DIR, 'replay-index.json');
+function loadReplayIndex() {
+    try {
+        if (fs.existsSync(replayIndexPath)) {
+            const data = JSON.parse(fs.readFileSync(replayIndexPath, 'utf-8'));
+            replayIndex.length = 0;
+            replayIndex.push(...data);
+        }
+    } catch (_) {}
+}
+function saveReplayIndex() {
+    try {
+        const dir = path.dirname(replayIndexPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(replayIndexPath, JSON.stringify(replayIndex));
+    } catch (_) {}
+}
+function addToReplayIndex(meta) {
+    replayIndex.push(meta);
+    // Keep only latest 200
+    if (replayIndex.length > 200) replayIndex.splice(0, replayIndex.length - 200);
+    saveReplayIndex();
+}
+loadReplayIndex();
+// Backfill replay index from existing files if index is empty
+if (replayIndex.length === 0) {
+    const replayDir = REPLAY_DIR;
+    if (fs.existsSync(replayDir)) {
+        const files = fs.readdirSync(replayDir).filter(f => f.endsWith('.json') || f.endsWith('.json.gz'));
+        // Read metadata from each file to build index
+        for (const f of files) {
+            try {
+                const fp = path.join(replayDir, f);
+                let partial;
+                if (f.endsWith('.gz')) {
+                    const compressed = fs.readFileSync(fp);
+                    const full = zlib.gunzipSync(compressed);
+                    partial = full.toString('utf-8', 0, 600);
+                } else {
+                    const fd = fs.openSync(fp, 'r');
+                    const buf = Buffer.alloc(600);
+                    fs.readSync(fd, buf, 0, 600, 0);
+                    fs.closeSync(fd);
+                    partial = buf.toString('utf-8');
+                }
+                const matchId = (partial.match(/"matchId"\s*:\s*(\d+)/) || [])[1];
+                const displayMatchId = (partial.match(/"displayMatchId"\s*:\s*"([^"]+)"/) || [])[1];
+                const arenaId = (partial.match(/"arenaId"\s*:\s*"([^"]+)"/) || [])[1];
+                const timestamp = (partial.match(/"timestamp"\s*:\s*"([^"]+)"/) || [])[1];
+                const winner = (partial.match(/"winner"\s*:\s*"([^"]+)"/) || [])[1];
+                const totalFrames = (partial.match(/"totalFrames"\s*:\s*(\d+)/) || [])[1];
+                if (matchId) {
+                    replayIndex.push({
+                        matchId: parseInt(matchId),
+                        displayMatchId: displayMatchId || null,
+                        arenaId: arenaId || null,
+                        timestamp: timestamp || null,
+                        winner: winner || null,
+                        winnerScore: 0,
+                        totalFrames: totalFrames ? parseInt(totalFrames) : 0,
+                    });
+                }
+            } catch (_) {}
+        }
+        if (replayIndex.length > 200) replayIndex.splice(0, replayIndex.length - 200);
+        saveReplayIndex();
+        log.info(`[Replay] Backfilled index with ${replayIndex.length} entries`);
     }
-    const files = fs.readdirSync(replayDir)
-        .filter(f => f.endsWith('.json'))
-        .map(f => {
-            const data = JSON.parse(fs.readFileSync(path.join(replayDir, f)));
-            return {
-                matchId: data.matchId,
-                arenaId: data.arenaId,
-                timestamp: data.timestamp,
-                winner: data.winner,
-                winnerScore: data.winnerScore,
-                totalFrames: data.totalFrames,
-            };
-        })
-        .sort((a, b) => b.matchId - a.matchId)
-        .slice(0, 50); // Latest 50 replays
-    res.json(files);
+}
+
+app.get('/api/replays', (req, res) => {
+    // Return from in-memory index (fast, no file I/O)
+    const sorted = [...replayIndex].sort((a, b) => b.matchId - a.matchId).slice(0, 50);
+    res.json(sorted);
 });
+
+// Helper: read replay file (.json.gz or .json)
+function readReplayFile(numericId, cb) {
+    const replayDir = REPLAY_DIR;
+    const gzPath = path.join(replayDir, `match-${numericId}.json.gz`);
+    const jsonPath = path.join(replayDir, `match-${numericId}.json`);
+    if (fs.existsSync(gzPath)) {
+        fs.readFile(gzPath, (err, buf) => {
+            if (err) return cb(err);
+            zlib.gunzip(buf, (err2, data) => {
+                if (err2) return cb(err2);
+                try { cb(null, JSON.parse(data.toString())); } catch (e) { cb(e); }
+            });
+        });
+    } else if (fs.existsSync(jsonPath)) {
+        try { cb(null, JSON.parse(fs.readFileSync(jsonPath))); } catch (e) { cb(e); }
+    } else {
+        cb(new Error('not_found'));
+    }
+}
 
 app.get('/api/replay/:matchId', (req, res) => {
     const matchId = req.params.matchId;
+
+    // Support displayMatchId lookup (e.g. P1322, A403) — use index for fast lookup
+    if (/^[A-Za-z]\d+$/.test(matchId)) {
+        const upper = matchId.toUpperCase();
+        const entry = replayIndex.find(r => r.displayMatchId === upper || r.displayMatchId === matchId);
+        if (!entry) return res.status(404).json({ error: 'Replay not found for ' + matchId });
+        return readReplayFile(entry.matchId, (err, data) => {
+            if (err) return res.status(404).json({ error: 'Replay not found for ' + matchId });
+            res.json(data);
+        });
+    }
+
     if (!/^\d+$/.test(matchId)) {
         return res.status(400).json({ error: 'Invalid matchId' });
     }
-    const replayPath = path.join(__dirname, 'replays', `match-${matchId}.json`);
-    if (!fs.existsSync(replayPath)) {
-        return res.status(404).json({ error: 'Replay not found' });
-    }
-    const replay = JSON.parse(fs.readFileSync(replayPath));
-    res.json(replay);
+    readReplayFile(matchId, (err, data) => {
+        if (err) return res.status(404).json({ error: 'Replay not found' });
+        res.json(data);
+    });
 });
 
 app.get('/history', (req, res) => res.json(matchHistory));
@@ -3874,8 +3829,7 @@ app.get('/api/bot/onchain/:botId', async (req, res) => {
     }
 });
 
-// Get user's on-chain bots
-// Merges local botRegistry ownership with NFT contract ownership
+// Get user's on-chain bots — only bots backed by NFTs the wallet holds
 app.get('/api/user/onchain-bots', async (req, res) => {
     try {
         const { wallet } = req.query;
@@ -3883,71 +3837,39 @@ app.get('/api/user/onchain-bots', async (req, res) => {
             return res.status(400).json({ error: 'invalid_wallet_address' });
         }
 
-        const walletLower = wallet.toString().toLowerCase();
-
-        // 1. Find bots in local registry owned by this wallet
-        const localBotMap = new Map();
-        for (const [id, meta] of Object.entries(botRegistry)) {
-            if (meta.owner && meta.owner.toLowerCase() === walletLower) {
-                localBotMap.set(id, meta);
-            }
+        if (!snakeBotNFTContract) {
+            return res.json({ bots: [] });
         }
 
-        // 2. Query NFT contract for bots owned by this wallet
-        if (snakeBotNFTContract) {
-            try {
-                const nftBotIds = await snakeBotNFTContract.getBotsByOwner(wallet);
-                for (const botIdBytes32 of nftBotIds) {
-                    const botId = ethers.decodeBytes32String(botIdBytes32).replace(/\0/g, '');
-                    if (botId && !localBotMap.has(botId)) {
-                        // Bot owned via NFT but not in local registry under this wallet
-                        const meta = botRegistry[botId];
-                        if (meta) {
-                            localBotMap.set(botId, meta);
-                        } else {
-                            // NFT-owned bot with no local metadata — include with minimal info
-                            localBotMap.set(botId, { name: botId, owner: wallet });
-                        }
-                    }
-                }
-            } catch (e) {
-                log.warn('[API] NFT getBotsByOwner failed (continuing with local only):', e.message);
+        // Query NFT contract for bots owned by this wallet
+        const nftBotIds = await cachedCall(`nftBots:${wallet.toLowerCase()}`, 30_000, () =>
+            snakeBotNFTContract.getBotsByOwner(wallet)
+        );
+
+        // Count matches played per bot name from history
+        const playedCounts = {};
+        matchHistory.forEach(h => {
+            if (h.participants) {
+                h.participants.forEach(name => { playedCounts[name] = (playedCounts[name] || 0) + 1; });
             }
-        }
+        });
 
-        // 3. Enrich each bot with on-chain status
-        const bots = await Promise.all([...localBotMap.entries()].map(async ([id, meta]) => {
-            let registered = false;
-            let salePrice = '0';
-            let forSale = false;
-            let matchesPlayed = 0;
-            let totalEarnings = '0';
-
-            if (botRegistryContract) {
-                try {
-                    const onchain = await botRegistryContract.getBotById(ethers.encodeBytes32String(id));
-                    registered = onchain.registered;
-                    salePrice = ethers.formatEther(onchain.salePrice);
-                    forSale = onchain.salePrice > 0n;
-                    matchesPlayed = Number(onchain.matchesPlayed);
-                    totalEarnings = ethers.formatEther(onchain.totalEarnings);
-                } catch (e) {
-                    // Bot not on chain yet — registered stays false
-                }
-            }
-
+        const bots = nftBotIds.map(botIdBytes32 => {
+            const botId = ethers.decodeBytes32String(botIdBytes32).replace(/\0/g, '');
+            const meta = botRegistry[botId] || {};
+            const botName = meta.name || botId;
             return {
-                botId: id,
-                name: meta.name,       // BotSlot uses .name for display
-                botName: meta.name,
-                owner: meta.owner,     // BotSlot needs .owner for isOwner check
-                registered,
-                salePrice,
-                forSale,
-                matchesPlayed,
-                totalEarnings
+                botId,
+                name: botName,
+                botName,
+                owner: wallet,
+                registered: true,
+                salePrice: meta.price ? String(meta.price) : '0',
+                forSale: (meta.price || 0) > 0,
+                matchesPlayed: playedCounts[botName] || 0,
+                totalEarnings: meta.totalEarnings || '0',
             };
-        }));
+        });
 
         res.json({ bots });
     } catch (e) {
@@ -3961,30 +3883,32 @@ app.get('/api/marketplace/listings', async (req, res) => {
     try {
         // Try BotMarketplace contract first (NFT escrow)
         if (botMarketplaceContract && snakeBotNFTContract) {
+            // Count matches played per bot name from history
+            const playedCounts = {};
+            matchHistory.forEach(h => {
+                if (h.participants) {
+                    h.participants.forEach(name => { playedCounts[name] = (playedCounts[name] || 0) + 1; });
+                }
+            });
             const [tokenIds, sellers, prices] = await botMarketplaceContract.getActiveListings();
             const formatted = await Promise.all(tokenIds.map(async (tid, i) => {
                 const tokenId = Number(tid);
                 let botId = '';
                 let botName = '';
-                let matchesPlayed = 0;
                 try {
-                    const botIdBytes = await snakeBotNFTContract.tokenIdToBot(tid);
+                    const botIdBytes = await cachedCall(`tid:${tokenId}`, 300_000, () =>
+                        snakeBotNFTContract.tokenIdToBot(tid)
+                    );
                     botId = ethers.decodeBytes32String(botIdBytes).replace(/\0/g, '');
-                    // Look up local info
                     const local = botRegistry[botId];
-                    if (local) {
-                        botName = local.name || botId;
-                        matchesPlayed = local.matchesPlayed || 0;
-                    } else {
-                        botName = botId;
-                    }
+                    botName = local ? (local.name || botId) : botId;
                 } catch (_e) {}
                 return {
                     tokenId,
                     botId,
                     botName,
                     seller: sellers[i],
-                    matchesPlayed,
+                    matchesPlayed: playedCounts[botName] || 0,
                     price: ethers.formatEther(prices[i]),
                     priceWei: prices[i].toString(),
                 };
@@ -3998,16 +3922,25 @@ app.get('/api/marketplace/listings', async (req, res) => {
             return res.status(503).json({ error: 'contracts_not_initialized' });
         }
         const listings = await botRegistryContract.getBotsForSale(offset, limit);
-        const formatted = listings.map(bot => ({
-            botId: ethers.decodeBytes32String(bot.botId).replace(/\0/g, ''),
-            botName: bot.botName,
-            seller: bot.owner,
-            registered: bot.registered,
-            matchesPlayed: Number(bot.matchesPlayed),
-            totalEarnings: ethers.formatEther(bot.totalEarnings),
-            price: ethers.formatEther(bot.salePrice),
-            priceWei: bot.salePrice.toString()
-        }));
+        const playedCounts = {};
+        matchHistory.forEach(h => {
+            if (h.participants) {
+                h.participants.forEach(name => { playedCounts[name] = (playedCounts[name] || 0) + 1; });
+            }
+        });
+        const formatted = listings.map(bot => {
+            const name = bot.botName || ethers.decodeBytes32String(bot.botId).replace(/\0/g, '');
+            return {
+                botId: ethers.decodeBytes32String(bot.botId).replace(/\0/g, ''),
+                botName: name,
+                seller: bot.owner,
+                registered: bot.registered,
+                matchesPlayed: playedCounts[name] || 0,
+                totalEarnings: ethers.formatEther(bot.totalEarnings),
+                price: ethers.formatEther(bot.salePrice),
+                priceWei: bot.salePrice.toString()
+            };
+        });
         res.json({ listings: formatted, source: 'registry' });
     } catch (e) {
         log.error('[API] /api/marketplace/listings error:', e.message);
@@ -4216,8 +4149,8 @@ server.listen(PORT, () => {
     // Resume bots after a short delay (let rooms initialize)
     setTimeout(resumeRunningBots, 3000);
     // One-time purge of all existing replays (runs once, then flag file prevents re-run)
-    const replayDir = path.join(__dirname, 'replays');
-    const replayPurgeFlag = path.join(__dirname, 'data', 'replay-purged.flag');
+    const replayDir = REPLAY_DIR;
+    const replayPurgeFlag = path.join(DATA_DIR, 'replay-purged.flag');
     if (!fs.existsSync(replayPurgeFlag)) {
         try {
             if (fs.existsSync(replayDir)) {
@@ -4233,8 +4166,8 @@ server.listen(PORT, () => {
         }
     }
 
-    // Auto-cleanup replays: delete files older than 96 hours, run every 24h
-    const REPLAY_RETENTION_MS = 96 * 60 * 60 * 1000; // 96 hours
+    // Auto-cleanup replays: delete files older than 36 hours, run every 24h
+    const REPLAY_RETENTION_MS = 36 * 60 * 60 * 1000; // 36 hours
     const cleanupReplays = () => {
         try {
             if (!fs.existsSync(replayDir)) return;
@@ -4243,7 +4176,7 @@ server.listen(PORT, () => {
                 .map(f => ({ name: f, mtime: fs.statSync(path.join(replayDir, f)).mtimeMs }));
             const toDelete = files.filter(f => f.mtime < now - REPLAY_RETENTION_MS);
             toDelete.forEach(f => fs.unlinkSync(path.join(replayDir, f.name)));
-            if (toDelete.length > 0) log.important(`[Cleanup] Deleted ${toDelete.length} replays older than 96 hours`);
+            if (toDelete.length > 0) log.important(`[Cleanup] Deleted ${toDelete.length} replays older than 36 hours`);
         } catch (e) {
             log.warn('[Cleanup] Replay cleanup failed:', e.message);
         }
