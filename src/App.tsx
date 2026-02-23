@@ -595,7 +595,7 @@ function BotManagement() {
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
         // Wait for on-chain state to propagate and wallet nonce to update
         setSellStatus('Waiting for approval to confirm...');
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 30; i++) {
           await new Promise(r => setTimeout(r, 2000));
           const newApproval = await publicClient.readContract({
             address: CONTRACTS.snakeBotNFT as `0x${string}`,
@@ -974,7 +974,7 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
         await fetch('/api/score/bet', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId }),
+          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName }),
         });
       } catch (_) { /* score award is best-effort */ }
 
@@ -1165,22 +1165,29 @@ function GameCanvas({
 
     const connect = () => {
         if (destroyed) return;
+        // Close any lingering previous connection before creating a new one
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+            ws.onclose = null; // prevent triggering reconnect from manual close
+            ws.close();
+        }
         ws = new WebSocket(wsUrl);
         ws.onopen = () => { setStatus('Connected!'); reconnectDelay = 1000; };
         ws.onclose = () => {
+            if (destroyed) return;
             setStatus('Disconnected — reconnecting...');
-            if (!destroyed) {
-                reconnectTimer = setTimeout(() => {
-                    reconnectDelay = Math.min(reconnectDelay * 2, 16000);
-                    connect();
-                }, reconnectDelay);
-            }
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+                reconnectDelay = Math.min(reconnectDelay * 2, 16000);
+                connect();
+            }, reconnectDelay);
         };
         ws.onerror = () => {}; // onclose will fire after this
         ws.onmessage = (e) => {
             try {
                 const msg = JSON.parse(e.data);
-                if (msg.type === 'update') render(msg.state);
+                if (msg.type === 'update' && msg.state && Array.isArray(msg.state.players) && Array.isArray(msg.state.food)) {
+                    render(msg.state);
+                }
             } catch (e) { console.error(e); }
         };
     };
@@ -1506,7 +1513,7 @@ function PointsPage() {
                 <h4 style={{ color: '#aaa', fontSize: '0.85rem', marginBottom: '6px' }}>Recent Activity</h4>
                 <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
                   {myScore.history.map((h: any, i: number) => (
-                    <div key={i} style={{
+                    <div key={h.ts || i} style={{
                       display: 'flex', justifyContent: 'space-between', padding: '4px 8px',
                       borderBottom: '1px solid #1b1b2b', fontSize: '0.8rem',
                     }}>
@@ -1542,7 +1549,7 @@ function PointsPage() {
         <h3>积分排行榜 (Top 50)</h3>
         <ul className="fighter-list">
           {leaderboard.map((p: any, i: number) => (
-            <li key={i} className="fighter-item alive">
+            <li key={p.address || i} className="fighter-item alive">
               <span className="fighter-name">
                 {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`}{' '}
                 {p.address ? (p.address.slice(0, 6) + '...' + p.address.slice(-4)) : 'unknown'}
@@ -1766,7 +1773,7 @@ function PortfolioPage() {
           ) : (
             <ul className="fighter-list">
               {data.activePositions.map((p: any, i: number) => (
-                <li key={i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <li key={`${p.matchId}-${p.botId}` || i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span className="fighter-name">
                     Match {p.displayMatchId} &middot; {p.botId}
                   </span>
@@ -1787,7 +1794,7 @@ function PortfolioPage() {
           ) : (
             <ul className="fighter-list">
               {data.betHistory.map((h: any, i: number) => (
-                <li key={i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <li key={h.ts || i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span className="fighter-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <span style={{
                       width: 8, height: 8, borderRadius: '50%', display: 'inline-block',
@@ -1817,7 +1824,7 @@ function PortfolioPage() {
           ) : (
             <ul className="fighter-list">
               {myBots.map((b: any, i: number) => (
-                <li key={i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <li key={b.botId || i} className="fighter-item alive" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span className="fighter-name">{b.botName || b.name || b.botId}</span>
                   <span style={{ display: 'flex', gap: '12px', fontSize: '0.8rem' }}>
                     <span style={{ color: 'var(--neon-green)' }}>{b.wins}W</span>
@@ -1948,7 +1955,7 @@ function MarketplacePage() {
             {listings.map((item, i) => {
               const isSeller = address && item.seller && item.seller.toLowerCase() === address.toLowerCase();
               return (
-                <div key={i} className="panel-card" style={{ marginBottom: '8px' }}>
+                <div key={item.tokenId || i} className="panel-card" style={{ marginBottom: '8px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
                       <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{item.botName || `Token #${item.tokenId}`}</div>
@@ -2259,7 +2266,7 @@ function ReplayPage() {
           <h3>🎬 Recent Matches</h3>
           <ul className="fighter-list" style={{ maxHeight: '70vh', overflowY: 'auto' }}>
             {replayList.map((r: any, i: number) => (
-              <li key={i} className="fighter-item alive" style={{ cursor: 'pointer' }} onClick={() => { setSearchInput(r.displayMatchId || String(r.matchId)); loadReplay(r.displayMatchId || String(r.matchId)); }}>
+              <li key={r.matchId || i} className="fighter-item alive" style={{ cursor: 'pointer' }} onClick={() => { setSearchInput(r.displayMatchId || String(r.matchId)); loadReplay(r.displayMatchId || String(r.matchId)); }}>
                 <span className="fighter-name">{r.displayMatchId || `#${r.matchId}`}</span>
                 <span className="fighter-length" style={{ fontSize: '11px' }}>{r.winner || 'No winner'}</span>
               </li>
@@ -2315,7 +2322,7 @@ function ReplayPage() {
           <h3>⚔️ Fighters</h3>
           <ul className="fighter-list">
             {[...players].sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p: any, i: number) => (
-              <li key={i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
+              <li key={p.id || i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
                 <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
                 <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
               </li>
@@ -2389,7 +2396,7 @@ function App() {
       } catch (_e) {}
     };
     load();
-    const t = setInterval(load, 30000);
+    const t = setInterval(load, 10000);
     return () => clearInterval(t);
   }, [needsLeaderboard]);
 
@@ -2426,7 +2433,7 @@ function App() {
                     <h2 style={{ color: 'var(--neon-green)', textAlign: 'center' }}>🦀 Performance</h2>
                     <ul className="fighter-list">
                       {perfLeaderboard.map((p: any, i: number) => (
-                        <li key={i} className="fighter-item alive">
+                        <li key={p.name || i} className="fighter-item alive">
                           <span className="fighter-name">
                             {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`} {p.name}
                           </span>
@@ -2440,7 +2447,7 @@ function App() {
                     <h2 style={{ color: 'var(--neon-pink)', textAlign: 'center' }}>⚔️ Competitive</h2>
                     <ul className="fighter-list">
                       {compLeaderboard.map((p: any, i: number) => (
-                        <li key={i} className="fighter-item alive">
+                        <li key={p.name || i} className="fighter-item alive">
                           <span className="fighter-name">
                             {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`} {p.name}
                           </span>
@@ -2493,7 +2500,7 @@ function App() {
                     <h3>⚔️ Fighters</h3>
                     <ul className="fighter-list">
                       {[...players].filter(p => !p.waiting).sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p, i) => (
-                        <li key={i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
+                        <li key={p.id || i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
                           <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
                           <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
                         </li>
@@ -2504,7 +2511,7 @@ function App() {
                       <h3>🏆 {isCompetitive ? 'Competitive' : 'Performance'} Leaderboard</h3>
                       <ul className="fighter-list">
                         {(isCompetitive ? compLeaderboard : perfLeaderboard).slice(0, 10).map((p: any, i: number) => (
-                          <li key={i} className="fighter-item">
+                          <li key={p.name || i} className="fighter-item">
                             <span className="fighter-name">{p.name}</span>
                             <span className="fighter-length">{p.wins}W</span>
                           </li>
