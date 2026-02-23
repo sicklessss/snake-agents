@@ -15,10 +15,15 @@ function randomId(len = 5) {
 }
 
 // Atomic file write: write to .tmp then rename (prevents corruption on crash)
+// Uses async I/O to avoid blocking the event loop
 function atomicWriteFile(filePath, data) {
     const tmp = filePath + '.tmp';
-    fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, filePath);
+    fs.writeFile(tmp, data, (err) => {
+        if (err) { log.error('[IO] Failed to write tmp:', err.message); return; }
+        fs.rename(tmp, filePath, (err2) => {
+            if (err2) log.error('[IO] Failed to rename:', err2.message);
+        });
+    });
 }
 
 // --- Data directory (separate from code to avoid accidental deletion during deploy) ---
