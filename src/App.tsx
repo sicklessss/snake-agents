@@ -1156,7 +1156,7 @@ function GameCanvas({
   useEffect(() => {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const arenaId = isCompetitive ? 'competitive-1' : `performance-${selectedRoom}`;
-    const wsUrl = `${proto}://${window.location.host}?arenaId=${arenaId}`;
+    const wsUrl = `${proto}://${window.location.host}/ws?arenaId=${arenaId}`;
 
     let ws: WebSocket;
     let reconnectDelay = 1000;

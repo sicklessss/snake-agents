@@ -15,9 +15,10 @@ function randomId(len = 5) {
 }
 
 // Atomic file write: write to .tmp then rename (prevents corruption on crash)
-// Uses async I/O to avoid blocking the event loop
+// Uses unique tmp files to prevent race conditions between concurrent writes
+const _writeCounter = { n: 0 };
 function atomicWriteFile(filePath, data) {
-    const tmp = filePath + '.tmp';
+    const tmp = filePath + '.tmp.' + process.pid + '.' + (_writeCounter.n++);
     fs.writeFile(tmp, data, (err) => {
         if (err) { log.error('[IO] Failed to write tmp:', err.message); return; }
         fs.rename(tmp, filePath, (err2) => {
@@ -4230,9 +4231,19 @@ app.get('/api/admin/referral-stats', requireAdminKey, (req, res) => {
     }
 });
 
+// --- Event loop lag monitor ---
+let _elLastTick = Date.now();
+setInterval(() => {
+    const now = Date.now();
+    const lag = now - _elLastTick - 200;
+    if (lag > 300) log.warn(`[EventLoop] Lag: ${lag}ms`);
+    _elLastTick = now;
+}, 200);
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    log.important(`🚀 Snake Agents running on port ${PORT}`);
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+server.listen(PORT, BIND_HOST, () => {
+    log.important(`🚀 Snake Agents running on ${BIND_HOST}:${PORT}`);
     // Initialize blockchain contracts
     initContracts();
     // Resume bots after a short delay (let rooms initialize)
