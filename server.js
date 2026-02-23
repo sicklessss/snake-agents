@@ -3066,6 +3066,23 @@ app.post('/api/admin/create-on-chain', requireAdminKey, async (req, res) => {
         res.status(500).json({ error: 'tx_failed', message: e.message });
     }
 });
+// Batch endpoint: returns all data needed for initial page load in one request
+app.get('/api/init', (req, res) => {
+    const perfCounts = {};
+    const compCounts = {};
+    matchHistory.forEach(h => {
+        if (!h.arenaId) return;
+        if (h.winner === 'No Winner' && h.score === 0) return;
+        const key = h.winner || 'No Winner';
+        if (h.arenaId.startsWith('performance')) perfCounts[key] = (perfCounts[key] || 0) + 1;
+        if (h.arenaId.startsWith('competitive')) compCounts[key] = (compCounts[key] || 0) + 1;
+    });
+    res.json({
+        perfLeaderboard: Object.entries(perfCounts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30),
+        compLeaderboard: Object.entries(compCounts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30),
+    });
+});
+
 app.get('/api/leaderboard/global', (req, res) => {
     res.json(leaderboardFromHistory());
 });

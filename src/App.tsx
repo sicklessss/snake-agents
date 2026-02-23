@@ -2387,12 +2387,12 @@ function App() {
     if (!needsLeaderboard) return;
     const load = async () => {
       try {
-        const [perfRes, compRes] = await Promise.all([
-          fetch('/api/leaderboard/performance'),
-          fetch('/api/leaderboard/competitive'),
-        ]);
-        if (perfRes.ok) setPerfLeaderboard(await perfRes.json());
-        if (compRes.ok) setCompLeaderboard(await compRes.json());
+        const res = await fetch('/api/init');
+        if (res.ok) {
+          const data = await res.json();
+          setPerfLeaderboard(data.perfLeaderboard || []);
+          setCompLeaderboard(data.compLeaderboard || []);
+        }
       } catch (_e) {}
     };
     load();

@@ -1,3 +1,17 @@
+@font-face {
+  font-family: 'Orbitron';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/orbitron-latin.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Orbitron';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/fonts/orbitron-latin.woff2) format('woff2');
+}
 :root { --bg-color: #050510; --panel: #0a0a1a; --neon-green: #00ff88; --neon-pink: #ff0055; --neon-blue: #00ccff; --text-dim: #8a8aa8; }
 * { box-sizing: border-box; }
 body { background-color: var(--bg-color); color: #fff; font-family: 'Orbitron', sans-serif; margin: 0; min-height: 100vh; overflow-x: hidden; overflow-y: auto; }
