@@ -664,7 +664,12 @@ async function _drainTxQueue() {
             } catch (e) {
                 const attempt = retries || 0;
                 const isRetryable = label.startsWith('createMatch') || label.startsWith('settleMatch');
-                if (isRetryable && attempt < 3) {
+                // "already exists" / "already settled" means the original TX succeeded but response was lost
+                const alreadyDone = e.reason && (e.reason.includes('already exists') || e.reason.includes('already settled'));
+                if (alreadyDone) {
+                    log.info(`[TxQueue] ${label} already done on-chain, treating as success`);
+                    if (resolve) resolve(null);
+                } else if (isRetryable && attempt < 3) {
                     log.warn(`[TxQueue] ${label} failed (attempt ${attempt + 1}/3), retrying in 5s: ${e.message}`);
                     await new Promise(r => setTimeout(r, 5000));
                     _txQueue.unshift({ label, fn, resolve, reject, retries: attempt + 1 });
