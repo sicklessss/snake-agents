@@ -9,6 +9,17 @@ const compression = require('compression');
 const zlib = require('zlib');
 const crypto = require('crypto');
 
+// --- Logging Config (must be early, used throughout) ---
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // 'debug' | 'info' | 'warn' | 'error'
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const log = {
+    debug: (...args) => LOG_LEVELS[LOG_LEVEL] <= 0 && console.log('[DEBUG]', ...args),
+    info: (...args) => LOG_LEVELS[LOG_LEVEL] <= 1 && console.log('[INFO]', ...args),
+    warn: (...args) => LOG_LEVELS[LOG_LEVEL] <= 2 && console.warn('[WARN]', ...args),
+    error: (...args) => LOG_LEVELS[LOG_LEVEL] <= 3 && console.error('[ERROR]', ...args),
+    important: (...args) => console.log('🔔', ...args), // Always show important events
+};
+
 // Generate a short random ID (cryptographically secure)
 function randomId(len = 5) {
     return crypto.randomBytes(Math.ceil(len * 3 / 4)).toString('base64url').slice(0, len);
@@ -231,17 +242,6 @@ function initContracts() {
         log.warn('[Blockchain] Contracts not initialized - set env vars or deploy contracts');
     }
 }
-
-// --- Logging Config ---
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // 'debug' | 'info' | 'warn' | 'error'
-const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
-const log = {
-    debug: (...args) => LOG_LEVELS[LOG_LEVEL] <= 0 && console.log('[DEBUG]', ...args),
-    info: (...args) => LOG_LEVELS[LOG_LEVEL] <= 1 && console.log('[INFO]', ...args),
-    warn: (...args) => LOG_LEVELS[LOG_LEVEL] <= 2 && console.warn('[WARN]', ...args),
-    error: (...args) => LOG_LEVELS[LOG_LEVEL] <= 3 && console.error('[ERROR]', ...args),
-    important: (...args) => console.log('🔔', ...args), // Always show important events
-};
 
 // --- Sandbox Config ---
 const BOTS_DIR = path.join(__dirname, 'bots');
@@ -2840,7 +2840,7 @@ app.post('/api/bot/edit-token', rateLimit({ windowMs: 60_000, max: 20 }), async 
             return res.status(403).json({ error: 'signature_mismatch', message: 'Signature does not match address' });
         }
 
-        // 3. Verify NFT ownership on-chain
+        // 3. Verify NFT ownership on-chain (or marketplace listing by this address)
         if (!snakeBotNFTContract) {
             return res.status(503).json({ error: 'contract_not_ready' });
         }
@@ -2850,7 +2850,17 @@ app.post('/api/bot/edit-token', rateLimit({ windowMs: 60_000, max: 20 }), async 
                 return res.status(403).json({ error: 'not_registered', message: 'Bot not registered (no NFT)' });
             }
             const nftOwner = await snakeBotNFTContract.ownerOf(tokenId);
-            if (nftOwner.toLowerCase() !== address.toLowerCase()) {
+            let authorized = nftOwner.toLowerCase() === address.toLowerCase();
+            // If NFT is in marketplace escrow, check if this address is the seller
+            if (!authorized && botMarketplaceContract) {
+                try {
+                    const listing = await botMarketplaceContract.listings(tokenId);
+                    if (listing.seller && listing.seller.toLowerCase() === address.toLowerCase() && listing.price > 0n) {
+                        authorized = true;
+                    }
+                } catch (_e) { /* listing check failed, deny */ }
+            }
+            if (!authorized) {
                 return res.status(403).json({ error: 'not_nft_owner', message: 'Address does not own the NFT for this bot' });
             }
         } catch (e) {
@@ -2991,14 +3001,24 @@ app.post('/api/competitive/enter', async (req, res) => {
         if (!expectedTo || tx.to?.toLowerCase() !== expectedTo) {
             return res.status(400).json({ error: 'wrong_recipient', message: 'Payment must be sent to the correct address' });
         }
-        // Verify TX sender owns the bot's NFT
+        // Verify TX sender owns the bot's NFT (or is the seller if listed on marketplace)
         if (snakeBotNFTContract) {
             try {
                 const botIdBytes32 = ethers.encodeBytes32String(botId);
                 const tokenId = await snakeBotNFTContract.botToTokenId(botIdBytes32);
                 if (tokenId > 0n) {
                     const nftOwner = await snakeBotNFTContract.ownerOf(tokenId);
-                    if (nftOwner.toLowerCase() !== tx.from.toLowerCase()) {
+                    let authorized = nftOwner.toLowerCase() === tx.from.toLowerCase();
+                    // If NFT is in marketplace escrow, allow the seller
+                    if (!authorized && botMarketplaceContract) {
+                        try {
+                            const listing = await botMarketplaceContract.listings(tokenId);
+                            if (listing.seller && listing.seller.toLowerCase() === tx.from.toLowerCase() && listing.price > 0n) {
+                                authorized = true;
+                            }
+                        } catch (_e) {}
+                    }
+                    if (!authorized) {
                         return res.status(403).json({ error: 'not_bot_owner', message: 'Only the bot NFT owner can enter competitions' });
                     }
                 }
@@ -3953,6 +3973,24 @@ app.get('/api/user/onchain-bots', async (req, res) => {
             snakeBotNFTContract.getBotsByOwner(wallet)
         );
 
+        // Also query marketplace for bots listed by this wallet (NFT in escrow)
+        let listedBotIds = [];
+        if (botMarketplaceContract) {
+            try {
+                const [tokenIds, sellers, prices] = await cachedCall(`listedBots:${wallet.toLowerCase()}`, 30_000, () =>
+                    botMarketplaceContract.getActiveListings()
+                );
+                for (let i = 0; i < tokenIds.length; i++) {
+                    if (sellers[i].toLowerCase() === wallet.toLowerCase()) {
+                        const botIdBytes = await cachedCall(`tid:${Number(tokenIds[i])}`, 300_000, () =>
+                            snakeBotNFTContract.tokenIdToBot(tokenIds[i])
+                        );
+                        listedBotIds.push({ botIdBytes, price: ethers.formatEther(prices[i]) });
+                    }
+                }
+            } catch (_e) { /* marketplace query failed, continue with owned bots only */ }
+        }
+
         // Count matches played per bot name from history
         const playedCounts = {};
         matchHistory.forEach(h => {
@@ -3960,6 +3998,8 @@ app.get('/api/user/onchain-bots', async (req, res) => {
                 h.participants.forEach(name => { playedCounts[name] = (playedCounts[name] || 0) + 1; });
             }
         });
+
+        const ownedSet = new Set(nftBotIds.map(b => ethers.decodeBytes32String(b).replace(/\0/g, '')));
 
         const bots = nftBotIds.map(botIdBytes32 => {
             const botId = ethers.decodeBytes32String(botIdBytes32).replace(/\0/g, '');
@@ -3971,12 +4011,33 @@ app.get('/api/user/onchain-bots', async (req, res) => {
                 botName,
                 owner: wallet,
                 registered: true,
+                listed: false,
                 salePrice: meta.price ? String(meta.price) : '0',
                 forSale: (meta.price || 0) > 0,
                 matchesPlayed: playedCounts[botName] || 0,
                 totalEarnings: meta.totalEarnings || '0',
             };
         });
+
+        // Add bots currently in marketplace escrow (listed by this user)
+        for (const { botIdBytes, price } of listedBotIds) {
+            const botId = ethers.decodeBytes32String(botIdBytes).replace(/\0/g, '');
+            if (ownedSet.has(botId)) continue; // already in owned list
+            const meta = botRegistry[botId] || {};
+            const botName = meta.name || botId;
+            bots.push({
+                botId,
+                name: botName,
+                botName,
+                owner: wallet,
+                registered: true,
+                listed: true,
+                salePrice: price,
+                forSale: true,
+                matchesPlayed: playedCounts[botName] || 0,
+                totalEarnings: meta.totalEarnings || '0',
+            });
+        }
 
         res.json({ bots });
     } catch (e) {

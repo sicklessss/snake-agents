@@ -712,20 +712,24 @@ function BotManagement() {
           <div key={bot.botId || i} style={{
             display: 'flex', justifyContent: 'space-between', alignItems: 'center',
             padding: '6px 8px', marginBottom: '4px', borderRadius: '6px',
-            background: 'rgba(0,255,136,0.08)', border: '1px solid rgba(0,255,136,0.3)',
+            background: bot.listed ? 'rgba(255,165,0,0.08)' : 'rgba(0,255,136,0.08)',
+            border: bot.listed ? '1px solid rgba(255,165,0,0.3)' : '1px solid rgba(0,255,136,0.3)',
           }}>
-            <span style={{ color: 'var(--neon-green)', fontWeight: 'bold', fontSize: '0.85rem', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              🤖 {bot.name}
+            <span style={{ color: bot.listed ? '#ffa500' : 'var(--neon-green)', fontWeight: 'bold', fontSize: '0.85rem', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {bot.listed ? '🏷️' : '🤖'} {bot.name}
+              {bot.listed && <span style={{ fontSize: '0.6rem', color: '#ffa500', marginLeft: '4px' }}>(Listed {bot.salePrice} ETH)</span>}
             </span>
             <div style={{ display: 'flex', gap: '4px', marginLeft: '6px', flexShrink: 0 }}>
               <button type="button" onClick={() => handleEditOpen(bot)}
                 style={{ padding: '2px 6px', fontSize: '0.65rem', background: '#1a1a2e', color: '#aaa', border: '1px solid #333', borderRadius: '4px', cursor: 'pointer' }}>
                 Edit
               </button>
-              <button type="button" onClick={() => { setSellBot(bot); setSellPrice(''); setSellStatus(''); }}
-                style={{ padding: '2px 6px', fontSize: '0.65rem', background: '#1a1a2e', color: 'var(--neon-pink)', border: '1px solid rgba(255,0,128,0.3)', borderRadius: '4px', cursor: 'pointer' }}>
-                Sell
-              </button>
+              {!bot.listed && (
+                <button type="button" onClick={() => { setSellBot(bot); setSellPrice(''); setSellStatus(''); }}
+                  style={{ padding: '2px 6px', fontSize: '0.65rem', background: '#1a1a2e', color: 'var(--neon-pink)', border: '1px solid rgba(255,0,128,0.3)', borderRadius: '4px', cursor: 'pointer' }}>
+                  Sell
+                </button>
+              )}
             </div>
           </div>
         ))}
