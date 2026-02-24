@@ -603,12 +603,10 @@ function getCurrentEpoch() {
 const displayIdToMatchId = {};
 
 function getNextDisplayId(type) {
-    // Include date prefix to avoid daily counter reset collisions (e.g. P0224-5 = Feb 24 #5)
-    const now = new Date();
-    const datePrefix = String(now.getUTCMonth() + 1).padStart(2, '0') + String(now.getUTCDate()).padStart(2, '0');
+    // Global counter (never resets) — keeps IDs short: P259, A47
     const displayId = type === 'competitive'
-        ? ('A' + datePrefix + '-' + compMatchCounter++)
-        : ('P' + datePrefix + '-' + perfMatchCounter++);
+        ? ('A' + compMatchCounter++)
+        : ('P' + perfMatchCounter++);
     saveCounters();
     return displayId;
 }
@@ -688,8 +686,7 @@ function checkDailyReset() {
     const today = new Date().toISOString().slice(0, 10);
     if (today !== lastResetDate) {
         lastResetDate = today;
-        perfMatchCounter = 1;
-        compMatchCounter = 1;
+        // Counters no longer reset — global IDs (P259, A47) must be unique across days
         saveCounters();
         for (const [, room] of rooms) {
             if (room.type === 'competitive') {
@@ -697,7 +694,7 @@ function checkDailyReset() {
                 savePaidEntries({});
             }
         }
-        log.important('[DailyReset] Match counters reset for: ' + today);
+        log.important('[DailyReset] New day: ' + today);
     }
 }
 setInterval(checkDailyReset, 60_000);
