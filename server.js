@@ -116,22 +116,6 @@ function savePaidEntries(entries) {
     try { atomicWriteFile(PAID_ENTRIES_FILE, JSON.stringify(entries, null, 2)); }
     catch (e) { log.error('[PaidEntries] Failed to save:', e.message); }
 }
-// --- Future bets persistence ---
-const FUTURE_BETS_FILE = path.join(DATA_DIR, 'future-bets.json');
-let futureBets = [];
-// status: 'pending' (waiting for match) | 'active' (bot in match, on-chain bet placed) | 'refund' (bot not in match) | 'won' | 'lost' | 'claimed'
-try {
-    if (fs.existsSync(FUTURE_BETS_FILE)) {
-        futureBets = JSON.parse(fs.readFileSync(FUTURE_BETS_FILE, 'utf8'));
-        log.info(`[FutureBets] Loaded ${futureBets.length} future bets`);
-    }
-} catch (e) { log.warn('[FutureBets] Failed to load:', e.message); futureBets = []; }
-function saveFutureBets() {
-    try { atomicWriteFile(FUTURE_BETS_FILE, JSON.stringify(futureBets, null, 2)); }
-    catch (e) { log.error('[FutureBets] Failed to save:', e.message); }
-}
-let _futureBetId = futureBets.length > 0 ? Math.max(...futureBets.map(b => b.id || 0)) + 1 : 1;
-
 // Clean up expired tokens every hour
 setInterval(() => {
     const now = Date.now();
@@ -641,91 +625,6 @@ function matchIdToDisplayId(matchId) {
     return null;
 }
 
-// Get match betting status from active rooms
-function getMatchBettingStatus(matchId) {
-    for (const [, room] of rooms) {
-        if (room.currentMatchId === matchId || room.currentMatchId === Number(matchId)) {
-            const aliveCount = Object.values(room.players).filter(p => p.alive).length;
-            const totalPlayers = Object.keys(room.players).length;
-            const isPlaying = room.gameState === 'PLAYING';
-            return {
-                found: true,
-                arenaType: room.type,
-                gameState: room.gameState,
-                aliveCount,
-                totalPlayers,
-                bettingOpen: !isPlaying || aliveCount > 5,
-                isFuture: room.gameState === 'WAITING' || (isPlaying && totalPlayers > 0 && aliveCount === totalPlayers),
-            };
-        }
-    }
-    // Match not found in any room — could be a future match
-    return { found: false, bettingOpen: true, isFuture: true };
-}
-
-// Resolve pending future bets when a match starts
-function resolveFutureBets(displayMatchId, matchId, players) {
-    const pending = futureBets.filter(b => b.displayMatchId === displayMatchId && b.status === 'pending');
-    if (pending.length === 0) return;
-
-    // Build set of participant names (uppercase) and botIds
-    const participantNames = new Set(players.map(p => p.name.toUpperCase()));
-    const participantBotIds = new Set(players.filter(p => p.botId).map(p => p.botId.toUpperCase()));
-
-    for (const bet of pending) {
-        const botUpper = bet.botName.toUpperCase();
-        const isParticipant = participantNames.has(botUpper) || participantBotIds.has(botUpper);
-
-        if (isParticipant) {
-            bet.status = 'active';
-            bet.matchId = matchId;
-            bet.resolvedAt = Date.now();
-            log.important(`[FutureBet] #${bet.id} ACTIVE — ${bet.botName} is in ${displayMatchId} (matchId=${matchId})`);
-
-            // Place on-chain bet using server wallet
-            if (pariMutuelContract) {
-                const USDC_ADDR = process.env.USDC_CONTRACT || '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
-                const betAmount = ethers.parseUnits(String(bet.amount), 6);
-                const botIdBytes32 = ethers.encodeBytes32String(bet.botName);
-                const betId = bet.id;
-                enqueueTx(`futureBet-approve-${betId}`, async (overrides) => {
-                    // Ensure USDC allowance for PariMutuel
-                    const usdcContract = new ethers.Contract(USDC_ADDR, [
-                        'function approve(address spender, uint256 amount) external returns (bool)',
-                        'function allowance(address owner, address spender) external view returns (uint256)',
-                    ], backendWallet);
-                    const allowance = await usdcContract.allowance(backendWallet.address, CONTRACTS.pariMutuel);
-                    if (allowance < betAmount) {
-                        const appTx = await usdcContract.approve(CONTRACTS.pariMutuel, ethers.MaxUint256, overrides);
-                        await appTx.wait();
-                        log.info(`[FutureBet] Approved USDC for PariMutuel`);
-                    }
-                });
-                enqueueTx(`futureBet-place-${betId}`, async (overrides) => {
-                    try {
-                        const tx = await pariMutuelContract.placeBet(matchId, botIdBytes32, betAmount, overrides);
-                        await tx.wait();
-                        log.important(`[FutureBet] #${betId} on-chain bet placed: ${bet.amount} USDC on ${bet.botName} in match ${matchId}`);
-                    } catch (e) {
-                        log.error(`[FutureBet] #${betId} on-chain bet FAILED: ${e.message}`);
-                        // Mark as refund since on-chain bet failed
-                        const fb = futureBets.find(b => b.id === betId);
-                        if (fb && fb.status === 'active') {
-                            fb.status = 'refund';
-                            saveFutureBets();
-                        }
-                    }
-                });
-            }
-        } else {
-            bet.status = 'refund';
-            bet.resolvedAt = Date.now();
-            log.important(`[FutureBet] #${bet.id} REFUND — ${bet.botName} not in ${displayMatchId}`);
-        }
-    }
-    saveFutureBets();
-}
-
 // --- Sequential blockchain TX queue (prevents nonce collisions) ---
 // fn receives txOverrides = { nonce } so each call uses the correct pending nonce
 const _txQueue = [];
@@ -821,8 +720,6 @@ const CONFIG = { gridSize: 30 };
 const MATCH_DURATION = 180; // 3 minutes in seconds
 const MAX_FOOD = 5;
 const DEATH_BLINK_TURNS = 24;
-const MAX_HP = 100;              // Initial/full HP
-const HP_DECAY_INTERVAL = 2;     // Lose 1 HP every 2 ticks (~25s to starve)
 
 const SPAWN_POINTS = [
     { x: 5, y: 5, dir: { x: 1, y: 0 } },
@@ -1216,21 +1113,8 @@ class GameRoom {
             }
             
             // Spawn new obstacle every 80 ticks (10 seconds at 125ms/tick)
-            // Difficulty scales with time: larger obstacles as match progresses
             if (this.obstacleTick % 80 === 0) {
-                const elapsed = MATCH_DURATION - this.matchTimeLeft; // seconds elapsed
-                let minCells, maxCells;
-                if (elapsed < 60) {
-                    // Minute 1: 1×1 ~ 4×4 (1-16 cells, but effectively small irregular shapes)
-                    minCells = 1; maxCells = 16;
-                } else if (elapsed < 120) {
-                    // Minute 2: 2×2 ~ 5×5 (4-25 cells)
-                    minCells = 4; maxCells = 25;
-                } else {
-                    // Minute 3: 3×3 ~ 6×6 (9-36 cells)
-                    minCells = 9; maxCells = 36;
-                }
-                this.spawnObstacle(minCells, maxCells);
+                this.spawnObstacle();
             }
         }
 
@@ -1324,10 +1208,8 @@ class GameRoom {
                         // Enemy head danger
                         if (enemyHeadDanger.has(nx + ',' + ny)) score -= 5000;
                         
-                        // Food attraction (HP-aware: urgent when hungry)
-                        let foodWeight = p.body.length < 8 ? 8 : 3;
-                        if (p.hp < 15) foodWeight = 40;
-                        else if (p.hp < 30) foodWeight = 20;
+                        // Food attraction (lower weight when long)
+                        const foodWeight = p.body.length < 8 ? 8 : 3;
                         let bestFoodDist = G * 2;
                         for (const f of (this.food || [])) {
                             const fd = Math.abs(nx - f.x) + Math.abs(ny - f.y);
@@ -1394,25 +1276,12 @@ class GameRoom {
             if (foodIndex !== -1) {
                 this.food.splice(foodIndex, 1);
                 p.score++;
-                p.hp = MAX_HP;
             } else {
                 p.body.pop();
             }
 
             p.body.unshift(newHead);
         });
-
-        // HP hunger decay
-        if (this.turn % HP_DECAY_INTERVAL === 0) {
-            Object.values(this.players).forEach(p => {
-                if (!p.alive) return;
-                p.hp -= 1;
-                if (p.hp <= 0) {
-                    p.hp = 0;
-                    this.killPlayer(p, 'starved');
-                }
-            });
-        }
 
         Object.values(this.players).forEach((p) => {
             if (!p.alive) return;
@@ -1424,6 +1293,18 @@ class GameRoom {
                     return;
                 }
             }
+
+            Object.values(this.players).forEach((other) => {
+                if (other.id === p.id || other.alive) return;
+                if (other.deathType === 'eaten') return;
+
+                for (const seg of other.body) {
+                    if (seg.x === head.x && seg.y === head.y) {
+                        this.killPlayer(p, 'corpse');
+                        return;
+                    }
+                }
+            });
 
             // Competitive: Check obstacle collision
             if (this.type === 'competitive' && p.alive) {
@@ -1537,9 +1418,9 @@ class GameRoom {
         this.broadcastState();
     }
 
-    spawnObstacle(minCells = 1, maxCells = 16) {
-        const size = Math.floor(Math.random() * (maxCells - minCells + 1)) + minCells;
-        const maxSize = size;
+    spawnObstacle() {
+        const size = Math.floor(Math.random() * 16) + 1; // 1 to 16 cells
+        const maxSize = Math.min(size, 12); // cap at 12 to not be too crazy
         
         // Pick a random seed position (avoid edges and existing obstacles)
         let seedX, seedY, tries = 0;
@@ -1643,13 +1524,20 @@ class GameRoom {
             p.body = [p.body[0]];
         }
 
-        // Death drops food: each body segment becomes food
-        if (p.body && p.body.length > 0) {
+        // Competitive arena: dead snake body becomes obstacles
+        if (this.type === 'competitive' && deathType !== 'eaten' && p.body && p.body.length > 0) {
             for (const seg of p.body) {
-                if (!this.food.some(f => f.x === seg.x && f.y === seg.y)) {
-                    this.food.push({ x: seg.x, y: seg.y });
-                }
+                this.obstacles.push({
+                    x: seg.x,
+                    y: seg.y,
+                    solid: true,
+                    blinkTimer: 0,
+                    fromCorpse: true,
+                });
             }
+            // Remove food that overlaps with new obstacles
+            this.food = this.food.filter(f => !p.body.some(seg => seg.x === f.x && seg.y === f.y));
+            log.info('[Competitive] Dead snake ' + p.name + ' body (' + p.body.length + ' cells) became obstacles');
         }
     }
 
@@ -1713,10 +1601,8 @@ class GameRoom {
         }
 
         // --- Score: match participation & placements ---
-        // Competitive arena awards 3x points
         const matchId = this.currentMatchId;
         const arenaType = this.type;
-        const arenaMultiplier = arenaType === 'competitive' ? 3 : 1;
         const allBotsInMatch = allPlayers.filter(p => p.botId);
         const ownersAwarded = new Set();
         for (const p of allBotsInMatch) {
@@ -1724,7 +1610,7 @@ class GameRoom {
             if (!ownerAddr || ownerAddr === 'unknown' || ownersAwarded.has(ownerAddr)) continue;
             ownersAwarded.add(ownerAddr);
             if (getDailyCount(ownerAddr, 'match_') < DAILY_MATCH_CAP) {
-                awardScore(ownerAddr, 'match_participate', MATCH_PARTICIPATE_POINTS * arenaMultiplier, { matchId, botId: p.botId });
+                awardScore(ownerAddr, 'match_participate', MATCH_PARTICIPATE_POINTS, { matchId, botId: p.botId });
             }
         }
 
@@ -1734,7 +1620,7 @@ class GameRoom {
                 const botId = placements[i];
                 const ownerAddr = botRegistry[botId]?.owner;
                 if (!ownerAddr || ownerAddr === 'unknown') continue;
-                awardScore(ownerAddr, 'match_place', MATCH_PLACE_REWARDS[i] * arenaMultiplier, { matchId, botId, place: i + 1 });
+                awardScore(ownerAddr, 'match_place', MATCH_PLACE_REWARDS[i], { matchId, botId, place: i + 1 });
             }
         }
     }
@@ -1927,7 +1813,6 @@ class GameRoom {
                 nextDirection: spawn.dir,
                 alive: true,
                 score: 0,
-                hp: MAX_HP,
                 ws: w.ws,
                 botType: w.botType,
                 botId: w.botId || id,
@@ -1945,8 +1830,7 @@ class GameRoom {
         this.matchTimeLeft = MATCH_DURATION;
         this.sendEvent('match_start', { matchId: this.currentMatchId, arenaId: this.id, arenaType: this.type });
 
-        // Resolve future bets for this match
-        resolveFutureBets(this.displayMatchId, this.currentMatchId, Object.values(this.players));
+        // Note: SnakeAgentsBetting contract does not require createMatch — bets are placed directly by matchId
     }
 
     broadcastState() {
@@ -1959,7 +1843,6 @@ class GameRoom {
             direction: p.direction,
             score: p.score,
             alive: p.alive,
-            hp: p.hp,
             blinking: !p.alive && p.deathTimer > 0,
             deathTimer: p.deathTimer,
             deathType: p.deathType,
@@ -2014,7 +1897,6 @@ class GameRoom {
                     body: p.body.map(s => ({ x: s.x, y: s.y })),
                     score: p.score,
                     alive: p.alive,
-                    hp: p.hp,
                     botType: p.botType,
                 })),
                 food: this.food.map(f => ({ x: f.x, y: f.y })),
@@ -3026,28 +2908,12 @@ app.get('/api/bot/:botId/code', (req, res) => {
 });
 
 // Look up numeric matchId by displayMatchId (e.g. "P2" → 5)
-// Also supports future match IDs (P314 when current is P313) for future betting
 app.get('/api/match/by-display-id', (req, res) => {
     const { id } = req.query;
     if (!id) return res.status(400).json({ error: 'missing id' });
-    const upper = id.toUpperCase();
-    const matchId = displayIdToMatchId[upper];
-    if (matchId != null) {
-        const status = getMatchBettingStatus(matchId);
-        return res.json({ displayMatchId: upper, matchId, bettingOpen: status.bettingOpen, isFuture: status.isFuture, aliveCount: status.aliveCount || 0 });
-    }
-    // Check if this is a valid future match ID
-    const m = upper.match(/^([PA])(\d+)$/);
-    if (m) {
-        const type = m[1];
-        const num = parseInt(m[2], 10);
-        const currentCounter = type === 'A' ? compMatchCounter : perfMatchCounter;
-        // Allow betting on matches up to 10 ahead of current counter
-        if (num >= currentCounter && num < currentCounter + 10) {
-            return res.json({ displayMatchId: upper, matchId: null, bettingOpen: true, isFuture: true, aliveCount: 0, futureMatch: true });
-        }
-    }
-    res.status(404).json({ error: 'not_found', message: 'No match found for ' + id });
+    const matchId = displayIdToMatchId[id.toUpperCase()];
+    if (matchId == null) return res.status(404).json({ error: 'not_found', message: 'No match found for ' + id });
+    res.json({ displayMatchId: id.toUpperCase(), matchId });
 });
 
 // --- Competitive Arena API ---
@@ -3781,192 +3647,19 @@ app.get('/api/portfolio', rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
     betHistory.sort((a, b) => (b.ts || 0) - (a.ts || 0));
     betHistory.splice(50);
 
-    // Include future bets in portfolio
-    const myFutureBets = futureBets.filter(b => b.address === addr);
-    const futurePending = myFutureBets.filter(b => b.status === 'pending').map(b => ({
-        id: b.id, displayMatchId: b.displayMatchId, botName: b.botName, amount: b.amount, createdAt: b.createdAt,
-    }));
-    const futureRefundable = myFutureBets.filter(b => b.status === 'refund').map(b => ({
-        id: b.id, displayMatchId: b.displayMatchId, botName: b.botName, amount: b.amount, createdAt: b.createdAt,
-    }));
-    // Add future refundable to claimable
-    for (const fb of futureRefundable) {
-        claimable.push({
-            matchId: null, displayMatchId: fb.displayMatchId, botName: fb.botName,
-            winnings: String(fb.amount), winningsWei: String(Math.round(fb.amount * 1e6)),
-            futureBetId: fb.id, type: 'future_refund',
-        });
-    }
-
     const claimableTotal = claimable.reduce((s, c) => s + parseFloat(c.winnings), 0).toFixed(2);
-    res.json({ activePositions, betHistory, claimable, claimableTotal, futurePending });
+    res.json({ activePositions, betHistory, claimable, claimableTotal });
 });
 
 // Award score when user places an on-chain USDC bet (called by frontend after tx confirms)
 app.post('/api/score/bet', (req, res) => {
     const { address, amount, matchId, botId } = req.body || {};
     if (!address || !amount) return res.status(400).json({ error: 'missing address or amount' });
-
-    // Rule 1: Block betting when ≤5 snakes alive
-    const status = getMatchBettingStatus(matchId);
-    if (status.found && !status.bettingOpen) {
-        return res.status(400).json({ error: 'betting_closed', message: '预测已关闭 (≤5条蛇存活)' });
-    }
-
     const addr = address.toLowerCase();
-    // Rule 2: Future/early bets get 50% bonus score points
-    const futureMultiplier = status.isFuture ? 1.5 : 1;
-    // Rule 3: Competitive arena bets get 3x score points
-    const arenaMultiplier = (status.found && status.arenaType === 'competitive') ? 3 : 1;
-    const pts = Math.max(1, Math.floor((parseFloat(amount) || 1) * futureMultiplier * arenaMultiplier));
-    const type = status.isFuture ? 'bet_future' : 'bet_activity';
-    awardScore(addr, type, pts, { matchId, botId });
+    const pts = Math.max(1, Math.floor(parseFloat(amount) || 1));
+    awardScore(addr, 'bet_activity', pts, { matchId, botId });
     const user = userScores[addr] || { total: 0 };
-    res.json({ ok: true, awarded: pts, total: user.total, future: status.isFuture });
-});
-
-// --- Future Bet APIs (server-side escrow for bets on upcoming matches) ---
-
-// Server wallet address for USDC escrow
-app.get('/api/server-wallet', (req, res) => {
-    if (!backendWallet) return res.status(500).json({ error: 'no_wallet' });
-    res.json({ address: backendWallet.address });
-});
-
-// Place a future bet (user transfers USDC to server wallet, then calls this)
-app.post('/api/bet/future', async (req, res) => {
-    const { address, displayMatchId, botName, amount, txHash } = req.body || {};
-    if (!address || !displayMatchId || !botName || !amount || !txHash) {
-        return res.status(400).json({ error: 'missing_params' });
-    }
-    const upper = displayMatchId.toUpperCase();
-    const m = upper.match(/^([PA])(\d+)$/);
-    if (!m) return res.status(400).json({ error: 'invalid_match_id' });
-
-    const type = m[1];
-    const num = parseInt(m[2], 10);
-    const currentCounter = type === 'A' ? compMatchCounter : perfMatchCounter;
-
-    // Must be a future match (not yet started)
-    if (displayIdToMatchId[upper] != null) {
-        return res.status(400).json({ error: 'match_already_started', message: '该比赛已开始，请直接下注' });
-    }
-    if (num < currentCounter || num >= currentCounter + 10) {
-        return res.status(400).json({ error: 'invalid_future_match', message: '只能预测接下来10场比赛' });
-    }
-
-    // Check txHash not already used
-    if (futureBets.some(b => b.txHash === txHash)) {
-        return res.status(400).json({ error: 'tx_already_used' });
-    }
-
-    // Verify the USDC transfer on-chain
-    const usdcAmount = parseFloat(amount);
-    if (isNaN(usdcAmount) || usdcAmount <= 0) return res.status(400).json({ error: 'invalid_amount' });
-
-    try {
-        const receipt = await provider.getTransactionReceipt(txHash);
-        if (!receipt || receipt.status !== 1) {
-            return res.status(400).json({ error: 'tx_failed', message: '交易未成功' });
-        }
-        // Verify it's a transfer to our wallet — check ERC20 Transfer event logs
-        const USDC_ADDR = (process.env.USDC_CONTRACT || '0x036CbD53842c5426634e7929541eC2318f3dCF7e').toLowerCase();
-        const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
-        const serverAddr = backendWallet.address.toLowerCase();
-        let verified = false;
-        for (const log_ of receipt.logs) {
-            if (log_.address.toLowerCase() === USDC_ADDR &&
-                log_.topics[0] === TRANSFER_TOPIC &&
-                log_.topics.length >= 3) {
-                const to = '0x' + log_.topics[2].slice(26).toLowerCase();
-                if (to === serverAddr) {
-                    verified = true;
-                    break;
-                }
-            }
-        }
-        if (!verified) {
-            return res.status(400).json({ error: 'tx_invalid', message: '未检测到向服务器钱包的USDC转账' });
-        }
-    } catch (e) {
-        return res.status(400).json({ error: 'tx_verify_failed', message: '验证交易失败: ' + e.message });
-    }
-
-    const bet = {
-        id: _futureBetId++,
-        address: address.toLowerCase(),
-        displayMatchId: upper,
-        botName: botName.toUpperCase(),
-        amount: usdcAmount,
-        txHash,
-        status: 'pending',
-        createdAt: Date.now(),
-        matchId: null,
-        resolvedAt: null,
-        claimTxHash: null,
-    };
-    futureBets.push(bet);
-    saveFutureBets();
-
-    // Award score points (future bet = 1.5x, competitive = 3x)
-    const arenaType = type === 'A' ? 'competitive' : 'performance';
-    const futureMultiplier = 1.5;
-    const arenaMultiplier = arenaType === 'competitive' ? 3 : 1;
-    const pts = Math.max(1, Math.floor(usdcAmount * futureMultiplier * arenaMultiplier));
-    awardScore(address.toLowerCase(), 'bet_future', pts, { displayMatchId: upper, botName: bet.botName });
-
-    log.important(`[FutureBet] #${bet.id} ${address} bet ${usdcAmount} USDC on ${bet.botName} for ${upper}`);
-    res.json({ ok: true, betId: bet.id, awarded: pts });
-});
-
-// Get user's future bets
-app.get('/api/bet/future/my', (req, res) => {
-    const { address } = req.query;
-    if (!address) return res.status(400).json({ error: 'missing address' });
-    const addr = address.toLowerCase();
-    const bets = futureBets.filter(b => b.address === addr).map(b => ({
-        id: b.id,
-        displayMatchId: b.displayMatchId,
-        botName: b.botName,
-        amount: b.amount,
-        status: b.status,
-        createdAt: b.createdAt,
-        resolvedAt: b.resolvedAt,
-    }));
-    res.json({ bets });
-});
-
-// Claim refunded future bet (bot didn't participate → USDC returned)
-app.post('/api/bet/future/claim', async (req, res) => {
-    const { address, betId } = req.body || {};
-    if (!address || !betId) return res.status(400).json({ error: 'missing_params' });
-    const addr = address.toLowerCase();
-    const bet = futureBets.find(b => b.id === betId && b.address === addr);
-    if (!bet) return res.status(404).json({ error: 'not_found' });
-    if (bet.status !== 'refund') {
-        return res.status(400).json({ error: 'not_refundable', message: '该预测不可退款 (状态: ' + bet.status + ')' });
-    }
-
-    // Transfer USDC back to user via server wallet
-    if (!backendWallet) return res.status(500).json({ error: 'no_wallet' });
-    const USDC_ADDR = process.env.USDC_CONTRACT || '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
-    try {
-        const usdcContract = new ethers.Contract(USDC_ADDR, [
-            'function transfer(address to, uint256 amount) external returns (bool)',
-        ], backendWallet);
-        const amt = ethers.parseUnits(String(bet.amount), 6);
-        const tx = await usdcContract.transfer(address, amt);
-        await tx.wait();
-        bet.status = 'claimed';
-        bet.claimTxHash = tx.hash;
-        bet.resolvedAt = Date.now();
-        saveFutureBets();
-        log.important(`[FutureBet] #${bet.id} refund ${bet.amount} USDC to ${address} tx=${tx.hash}`);
-        res.json({ ok: true, txHash: tx.hash });
-    } catch (e) {
-        log.error(`[FutureBet] Refund failed for #${bet.id}:`, e.message);
-        res.status(500).json({ error: 'refund_failed', message: e.message });
-    }
+    res.json({ ok: true, awarded: pts, total: user.total });
 });
 
 // --- Score APIs ---

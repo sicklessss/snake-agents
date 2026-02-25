@@ -270,11 +270,11 @@ Room
 ├── type: "performance" | "competitive"
 ├── maxPlayers: 10
 ├── gameState: "WAITING" → "COUNTDOWN" → "PLAYING" → "GAMEOVER" → "WAITING"
-├── players: { [id]: Player }   // Player includes hp field (0-100)
+├── players: { [id]: Player }
 ├── waitingRoom: { [id]: WaitingPlayer }
-├── food: [{ x, y }]          // 最多 5 个 (+ kill drops)
-├── obstacles: [{ x, y, solid, blinkTimer }]  // 仅 competitive (自然生成)
-├── replayFrames: [...]        // 每 tick 记录一帧 (含 hp)
+├── food: [{ x, y }]          // 最多 5 个
+├── obstacles: [{ x, y, solid, blinkTimer }]  // 仅 competitive
+├── replayFrames: [...]        // 每 tick 记录一帧
 └── timerSeconds / turn / epoch
 ```
 
@@ -293,13 +293,12 @@ COUNTDOWN (5s)
 PLAYING (180s = 3分钟)
   ├─ 每 125ms 一个 tick (8 FPS)
   │   ├─ 移动所有蛇
-  │   ├─ 食物拾取 (+1 分, 蛇变长, HP 回满)
-  │   ├─ HP 饥饿递减 (每 2 tick -1 HP, HP=0 → 饿死)
   │   ├─ 碰撞检测 (墙壁、自身、其他蛇、障碍物)
-  │   ├─ 死亡掉落食物 (蛇身体变食物)
-  │   ├─ 记录回放帧 (含 hp 字段)
-  │   └─ 广播状态给所有 WebSocket 客户端 (含 hp 字段)
-  ├─ 障碍物生成 (仅 competitive, 自然生成)
+  │   ├─ 食物拾取 (+1 分, 蛇变长)
+  │   ├─ 死亡处理 (24 tick 后移除)
+  │   ├─ 记录回放帧
+  │   └─ 广播状态给所有 WebSocket 客户端
+  ├─ 障碍物生成 (仅 competitive, 每 30 tick)
   └─ 最后一条蛇存活 → 提前结束
 
 GAMEOVER (5s)
@@ -321,26 +320,15 @@ GAMEOVER (5s)
 | 头撞身体 (长蛇吃短蛇) | 短蛇被截断, 长蛇吞噬部分身体变长 |
 | 撞障碍物 (solid) | 死亡 |
 | 撞障碍物 (blinking) | 可通过 |
-| HP 降到 0 | 饥饿死亡 (starved) |
-
-### HP 饥饿机制
-
-- 初始 HP: 100 (`MAX_HP`)
-- 每 2 tick 减 1 HP (`HP_DECAY_INTERVAL`)
-- 吃食物: HP 回满 100
-- HP ≤ 0: 蛇死亡 (deathType: 'starved')
-- 死亡掉落: 蛇身体的每一节变成食物 (所有死亡类型均生效)
 
 ### 蛇的 AI 决策
 
 ```javascript
 // 两类 Bot:
 // 1. WebSocket Bot (用户上传脚本): 通过 Worker 线程执行用户代码, 返回 direction
-// 2. Normal Bot (系统填充): 使用 flood-fill 算法 (HP 感知)
+// 2. Normal Bot (系统填充): 使用 flood-fill 算法
 //    - 计算每个方向的可达空间
-//    - 评分: 空间 × 2 + 食物距离 × weight + 墙壁距离 × -0.3
-//    - HP < 30: food weight = 20 (紧急觅食)
-//    - HP < 15: food weight = 40 (生死攸关)
+//    - 评分: 空间 × 2 + 食物距离 × 8-3 + 墙壁距离 × -0.3
 //    - 选择最高分方向
 ```
 
@@ -350,9 +338,8 @@ GameCanvas 使用 `<canvas>` 绘制 30×30 网格:
 - 网格线: 半透明灰色
 - 蛇身: 纯色方块, 头部带字母标识
 - 蛇头: 三角形箭头指示方向
-- **HP 条**: 蛇头上方 4px, 宽 cellSize, 高 3px, 颜色: 绿(>50) / 橙(>25) / 红(≤25)
-- 食物: 红色圆点 (含击杀掉落)
-- 障碍物: 红色 (solid) / 黄色闪烁 (passable), 仅自然生成
+- 食物: 自定义 SVG 图标
+- 障碍物: 红色 (solid) / 黄色闪烁 (passable)
 - Overlay: 倒计时 "GET READY!", 结束 "WINNER"
 
 ---
@@ -552,7 +539,6 @@ ws://host:4001?arenaId=performance-1
         "direction": { "x": 1, "y": 0 },
         "alive": true,
         "score": 5,
-        "hp": 85,
         "length": 8,
         "botType": "agent",
         "botId": "bot_123"
@@ -614,8 +600,7 @@ ws://host:4001?arenaId=performance-1
           "color": "#FF0000",
           "body": [{ "x": 15, "y": 3 }, { "x": 15, "y": 2 }, { "x": 15, "y": 1 }],
           "alive": true,
-          "score": 0,
-          "hp": 100
+          "score": 0
         }
       ],
       "food": [{ "x": 10, "y": 15 }],
@@ -745,9 +730,8 @@ B 邀请 C → A 获得 L2 奖励 (+50 积分), B 获得 L1 奖励 (+100 积分)
 function move(state) {
   // state.myHead: { x, y }
   // state.myBody: [{ x, y }, ...]
-  // state.myHp: 0-100              // 当前 HP (饥饿值)
-  // state.food: [{ x, y }, ...]    // 含击杀掉落的食物
-  // state.enemies: [{ body: [{ x, y }], hp: 85, ... }, ...]
+  // state.food: [{ x, y }, ...]
+  // state.enemies: [{ body: [{ x, y }], ... }, ...]
   // state.obstacles: [{ x, y, solid }, ...]
   // state.gridSize: 30
 

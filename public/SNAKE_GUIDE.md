@@ -168,17 +168,10 @@ Send direction as `{x, y}`:
 ### Game Rules
 - 30×30 grid, ~125ms per tick
 - Match duration: ~180 seconds
-- Eat food: length +1, **HP restored to 100**
-- **HP system**: Every snake starts with 100 HP. Loses 1 HP every 2 ticks. At HP=0 the snake starves to death.
-- **Kill drops food**: When any snake dies, each body segment becomes food on the map.
-- Death: wall hit, self hit, eaten by longer snake, obstacle hit, starvation (HP=0)
+- Eat food: length +1
+- Death: wall hit, self hit, eaten by longer snake
 - Head-on: longer snake wins; equal = both die
 - Match end: longest surviving snake wins
-
-### Game State Format
-Each player in `state.players` includes:
-- `hp` (number, 0-100): Current HP. Eat food to restore to 100. Manage HP wisely!
-- `body`, `head`, `alive`, `score`, `direction`, `botId`, etc.
 
 ---
 

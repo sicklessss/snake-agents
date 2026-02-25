@@ -42,20 +42,14 @@ Snake Agents 是一个实时多人贪吃蛇竞技场，玩家或AI bot在同一�
 - 固定出生点，初始长度=3
 - 不能立刻反向
 
-3) HP 饥饿系统
-- 每条蛇初始 HP=100
-- 每 2 tick 减 1 HP，HP=0 饿死
-- 吃食物 HP 回满 100
+3) 死亡
+- 撞墙 / 自撞 / 撞尸体：死亡
 
-4) 死亡与掉落
-- 撞墙 / 自撞 / 饿死(HP=0)：死亡
-- 蛇死后身体每一节变成食物
-
-5) 蛇对蛇
+4) 蛇对蛇
 - 头对头：更长者生存；同长同死
 - 头撞到别人身体：更长者"吃掉"对方一段；更短者死亡
 
-6) 胜负
+5) 胜负
 - 仅剩1条：胜 | 全灭：No Winner | 时间到：最长者胜
 `;
 
@@ -65,17 +59,14 @@ const COMPETITIVE_RULES = `⚔️ 竞技场规则
 
 与表演场的不同：
 🧱 障碍物系统
-- 比赛期间随机生成障碍物（不规则形状）
-- 障碍物生成时闪烁（黄色），此时可穿越
+- 比赛期间每10秒随机生成障碍物（1×1 ~ 4×4 不规则形状）
+- 障碍物生成时闪烁2秒（黄色闪烁），此时可以穿越
 - 闪烁结束后变为实体障碍（红色），蛇撞上即死
-
-❤️ HP 饥饿 & 掉落
-- 每条蛇 HP=100，每 2 tick -1 HP，HP=0 饿死
-- 吃食物 HP 回满 | 击杀后蛇身变食物
 
 💰 进场机制
 - 默认：系统随机从已注册 Agent Bot 中挑选上场
 - 付费进场：支付 0.001 ETH 可选择指定场次上场
+- 付费进场的 bot 该场结束后回到随机挑选状态
 
 📋 基础规则同表演场
 - 5秒赛前准备 → 3分钟比赛 → 5秒休息
@@ -873,7 +864,7 @@ function BotManagement() {
 }
 
 // Prediction — on-chain USDC betting via SnakeAgentsPariMutuel contract
-function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayMatchId: string | null; epoch: number; arenaType: 'performance' | 'competitive'; aliveCount: number }) {
+function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: string | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
   const { isConnected, address } = useAccount();
   const { writeContractAsync } = useWriteContract();
   const [botName, setBotName] = useState('');
@@ -889,23 +880,14 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
   const handlePredict = async () => {
     const input = targetMatch.trim().toUpperCase();
     if (!/^[PA]\d+$/.test(input)) return alert('请输入比赛编号，如 P5 或 A3');
-    let mid: number | null = null;
-    let bettingOpen = true;
-    let isFutureMatch = false;
+    let mid: number;
     try {
       const r = await fetch('/api/match/by-display-id?id=' + encodeURIComponent(input));
       if (!r.ok) return alert('无法找到比赛 ' + input);
       const d = await r.json();
       mid = d.matchId;
-      bettingOpen = d.bettingOpen !== false;
-      isFutureMatch = !!d.futureMatch; // true = match doesn't exist yet (server-managed bet)
-      if (!isFutureMatch && d.isFuture) isFutureMatch = false; // existing match in early state = still on-chain bet
     } catch { return alert('查询比赛编号失败'); }
-    if (!isFutureMatch && mid == null) return alert('无法解析比赛编号');
-    if (!bettingOpen) {
-      setStatus('❌ 预测已关闭 (≤5条蛇存活)');
-      return;
-    }
+    if (isNaN(mid)) return alert('无法解析比赛编号');
     if (!botName) return alert('请输入机器人名称');
     if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) return alert('请输入 USDC 预测金额');
     if (!isConnected || !address) return alert('请先连接钱包');
@@ -931,51 +913,6 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
         return;
       }
 
-      // --- Future match: transfer USDC to server wallet, server manages the bet ---
-      if (isFutureMatch) {
-        // Get server wallet address
-        let serverWallet: string;
-        try {
-          const wr = await fetch('/api/server-wallet');
-          const wd = await wr.json();
-          serverWallet = wd.address;
-        } catch { setStatus('❌ 获取服务器钱包失败'); setBusy(false); return; }
-
-        // Transfer USDC to server wallet
-        setStatus('转账 USDC 到托管钱包...');
-        const transferTx = await writeContractAsync({
-          address: CONTRACTS.usdc as `0x${string}`,
-          abi: ERC20_ABI,
-          functionName: 'transfer',
-          args: [serverWallet as `0x${string}`, usdcAmount],
-          gas: 100_000n,
-        });
-        setStatus('等待转账确认...');
-        await publicClient.waitForTransactionReceipt({ hash: transferTx as `0x${string}` });
-
-        // Register future bet on server
-        setStatus('注册预测...');
-        const fbr = await fetch('/api/bet/future', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, displayMatchId: input, botName, amount: parseFloat(amount), txHash: transferTx }),
-        });
-        const fbd = await fbr.json();
-        if (!fbr.ok) {
-          setStatus('❌ ' + (fbd.message || fbd.error || '注册预测失败'));
-          setBusy(false);
-          return;
-        }
-
-        const bonusParts: string[] = ['提前预测 +50%'];
-        if (arenaType === 'competitive') bonusParts.push('竞技场 3x');
-        setStatus(`✅ 未来预测已登记！${amount} USDC 预测 ${botName} 赢 ${input} (${bonusParts.join(', ')})\n如果 ${botName} 未参赛，USDC 将退回到 Portfolio`);
-        setAmount('');
-        setBusy(false);
-        return;
-      }
-
-      // --- Current/active match: on-chain bet via PariMutuel contract ---
       // Step 1: Check match exists on-chain
       setStatus('验证链上比赛...');
       try {
@@ -983,7 +920,7 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
           address: CONTRACTS.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'matches',
-          args: [BigInt(mid!)],
+          args: [BigInt(mid)],
         }) as any;
         if (!matchData || matchData[0] === 0n) {
           setStatus('❌ 该比赛尚未在链上创建 — 请等待新比赛开始后再下注');
@@ -1029,7 +966,7 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
         address: CONTRACTS.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
-        args: [BigInt(mid!), botIdBytes32, usdcAmount],
+        args: [BigInt(mid), botIdBytes32, usdcAmount],
         gas: 300_000n,
       });
 
@@ -1045,10 +982,7 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
         });
       } catch (_) { /* score award is best-effort */ }
 
-      const bonusParts: string[] = [];
-      if (arenaType === 'competitive') bonusParts.push('竞技场 3x');
-      const bonusStr = bonusParts.length > 0 ? ` (${bonusParts.join(', ')})` : '';
-      setStatus(`✅ 预测成功！${amount} USDC 预测 ${botName} 赢${bonusStr}`);
+      setStatus(`✅ 预测成功！${amount} USDC 预测 ${botName} 赢`);
       setAmount('');
     } catch (e: any) {
       // Extract revert reason from error chain
@@ -1080,17 +1014,10 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
     }
   };
 
-  // Check if current match betting is blocked (≤5 alive)
-  const currentMatchSelected = targetMatch.trim().toUpperCase() === (displayMatchId || '').toUpperCase();
-  const bettingBlocked = currentMatchSelected && aliveCount > 0 && aliveCount <= 5;
-
   return (
     <div className="panel-card">
       <div className="panel-row"><span>当前比赛</span><span>{displayMatchId ? `Epoch ${epoch} #${displayMatchId}` : '--'}</span></div>
-      {arenaType === 'competitive' && <div style={{ fontSize: '0.7rem', color: 'var(--neon-pink)', marginTop: '4px' }}>竞技场积分 3x</div>}
-      {aliveCount > 0 && aliveCount <= 5 && <div style={{ fontSize: '0.7rem', color: '#ff3333', marginTop: '4px' }}>当前比赛预测已关闭 (剩余 {aliveCount} 条蛇)</div>}
-      <div style={{ fontSize: '0.65rem', color: 'var(--neon-blue)', marginTop: '4px' }}>支持未来比赛 (如 {displayMatchId ? displayMatchId.replace(/\d+/, n => String(Number(n) + 1)) : 'P下一场'}) 积分 +50%</div>
-      <input placeholder="比赛编号 (如 P5, A3, 或未来场次)" value={targetMatch} onChange={e => setTargetMatch(e.target.value)} />
+      <input placeholder="比赛编号 (如 P5, A3)" value={targetMatch} onChange={e => setTargetMatch(e.target.value)} />
       <input placeholder="机器人名称 (预测谁赢?)" value={botName} onChange={e => setBotName(e.target.value)} style={{ marginTop: '6px' }} />
       <input placeholder="USDC 金额" value={amount} onChange={e => setAmount(e.target.value)} type="number" min="1" step="1" style={{ marginTop: '6px' }} />
       <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
@@ -1101,8 +1028,8 @@ function Prediction({ displayMatchId, epoch, arenaType, aliveCount }: { displayM
           </button>
         ))}
       </div>
-      <button onClick={handlePredict} disabled={busy || bettingBlocked} className={bettingBlocked ? 'btn-disabled' : ''} style={{ marginTop: '6px' }}>
-        {busy ? '⏳ ' + status : bettingBlocked ? '🚫 预测已关闭' : '💰 USDC 预测'}
+      <button onClick={handlePredict} disabled={busy} style={{ marginTop: '6px' }}>
+        {busy ? '⏳ ' + status : '💰 USDC 预测'}
       </button>
       {!busy && status && <div className="muted" style={{ marginTop: '6px' }}>{status}</div>}
     </div>
@@ -1425,19 +1352,6 @@ function GameCanvas({
 
             ctx.shadowBlur = 0;
             ctx.globalAlpha = 1;
-
-            // HP bar above snake head
-            if (p.alive && p.hp !== undefined) {
-              const hpRatio = p.hp / 100;
-              const barW = cellSize;
-              const barH = 3;
-              const barX = head.x * cellSize;
-              const barY = head.y * cellSize - 4;
-              ctx.fillStyle = 'rgba(0,0,0,0.5)';
-              ctx.fillRect(barX, barY, barW, barH);
-              ctx.fillStyle = p.hp > 50 ? '#00ff00' : p.hp > 25 ? '#ffaa00' : '#ff0000';
-              ctx.fillRect(barX, barY, barW * hpRatio, barH);
-            }
         });
     };
 
@@ -1737,28 +1651,13 @@ function PortfolioPage() {
     let claimed = 0;
     for (const item of data.claimable) {
       try {
-        if (item.type === 'future_refund' && item.futureBetId) {
-          // Claim future bet refund from server
-          const r = await fetch('/api/bet/future/claim', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ address, betId: item.futureBetId }),
-          });
-          if (!r.ok) {
-            const d = await r.json();
-            setClaimStatus(`Refund #${item.futureBetId} failed: ${d.message || d.error}`);
-            continue;
-          }
-        } else {
-          // Claim on-chain winnings
-          await writeContractAsync({
-            address: CONTRACTS.pariMutuel as `0x${string}`,
-            abi: PARI_MUTUEL_ABI,
-            functionName: 'claimWinnings',
-            args: [BigInt(item.matchId)],
-            gas: 200_000n,
-          });
-        }
+        await writeContractAsync({
+          address: CONTRACTS.pariMutuel as `0x${string}`,
+          abi: PARI_MUTUEL_ABI,
+          functionName: 'claimWinnings',
+          args: [BigInt(item.matchId)],
+          gas: 200_000n,
+        });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${data.claimable.length}...`);
       } catch (e: any) {
@@ -1768,7 +1667,7 @@ function PortfolioPage() {
           setClaiming(false);
           return;
         }
-        setClaimStatus(`Match #${item.matchId || item.displayMatchId} failed, continuing...`);
+        setClaimStatus(`Match #${item.matchId} failed, continuing...`);
       }
     }
     setClaiming(false);
@@ -1872,28 +1771,6 @@ function PortfolioPage() {
         <div className="panel-card muted" style={{ textAlign: 'center', padding: 24 }}>Loading...</div>
       ) : tab === 'positions' ? (
         <div className="panel-section">
-          {/* Pending Future Bets */}
-          {data?.futurePending && data.futurePending.length > 0 && (
-            <>
-              <h3 style={{ borderColor: '#ff8800' }}>Pending Future Bets</h3>
-              <ul className="fighter-list">
-                {data.futurePending.map((fb: any) => (
-                  <li key={fb.id} className="fighter-item" style={{ borderLeftColor: '#ff8800' }}>
-                    <span className="fighter-name" style={{ color: '#ff8800' }}>
-                      {fb.displayMatchId} &middot; {fb.botName}
-                    </span>
-                    <span style={{ display: 'flex', gap: '8px', fontSize: '0.8rem', alignItems: 'center' }}>
-                      <span style={{ color: 'var(--neon-blue)' }}>{fb.amount} USDC</span>
-                      <span style={{ color: '#ff8800', fontSize: '0.65rem' }}>PENDING</span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: 4, marginBottom: 12 }}>
-                Bot 未参赛时 USDC 将自动退回 (Claimable)
-              </div>
-            </>
-          )}
           <h3>Active Positions</h3>
           {(!data?.activePositions || data.activePositions.length === 0) ? (
             <div className="panel-card muted">No active positions</div>
@@ -2609,7 +2486,7 @@ function App() {
                   )}
                   <div className="panel-section">
                     <h3>🔮 Prediction</h3>
-                    <Prediction displayMatchId={displayMatchId} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} aliveCount={players.filter(p => p.alive && !p.waiting).length} />
+                    <Prediction displayMatchId={displayMatchId} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} />
                   </div>
                 </aside>
 
