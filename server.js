@@ -238,6 +238,19 @@ function initContracts() {
         setInterval(pollBotRegisteredEvents, 30_000);
         pollBotRegisteredEvents(); // initial run
         log.important('[Blockchain] Polling for BotRegistered events every 30s...');
+
+        // Create initial match on-chain for all existing rooms so settleMatch works after first game
+        for (const [, room] of rooms) {
+            const initMatchId = room.currentMatchId;
+            if (initMatchId != null) {
+                enqueueTx(`createMatch ${initMatchId} (init)`, async (overrides) => {
+                    const startTime = Math.floor(Date.now() / 1000) + 10;
+                    const tx = await pariMutuelContract.createMatch(initMatchId, startTime, overrides);
+                    await tx.wait();
+                    log.important(`[Blockchain] createMatch #${initMatchId} (init, room ${room.id}) confirmed`);
+                });
+            }
+        }
     } else {
         log.warn('[Blockchain] Contracts not initialized - set env vars or deploy contracts');
     }
@@ -1006,17 +1019,6 @@ class GameRoom {
 
         this._colorIndex = 0;
         this._intervals = [];
-
-        // Create initial match on-chain so settleMatch works after first game
-        if (pariMutuelContract) {
-            const initMatchId = this.currentMatchId;
-            enqueueTx(`createMatch ${initMatchId} (init)`, async (overrides) => {
-                const startTime = Math.floor(Date.now() / 1000) + 10;
-                const tx = await pariMutuelContract.createMatch(initMatchId, startTime, overrides);
-                await tx.wait();
-                log.important(`[Blockchain] createMatch #${initMatchId} (init) confirmed`);
-            });
-        }
 
         this.startLoops();
     }
