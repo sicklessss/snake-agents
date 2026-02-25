@@ -1949,7 +1949,6 @@ function MarketplacePage() {
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'cancel',
         args: [BigInt(item.tokenId)],
-        gas: 200_000n,
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });

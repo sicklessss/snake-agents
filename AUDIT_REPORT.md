@@ -1,334 +1,202 @@
-# Snake Agents 安全审计报告
+# Snake Agents — 代码审计报告 v2
 
-> 审计日期: 2026-02-24
-> 审计范围: server.js (~4500 行), src/App.tsx (~2550 行)
-
-## 概要
-
-| 严重程度 | 数量 |
-|----------|------|
-| CRITICAL | 3 |
-| HIGH | 8 |
-| MEDIUM | 8 |
-| LOW | 5 |
+**日期**: 2026-02-26
+**审计范围**: `server.js` (~4406 行) + `src/App.tsx` (~2601 行)
+**审计人**: Claude (自动化审计)
 
 ---
 
-## CRITICAL — 必须立即修复
+## 摘要
 
-### C1. 前端 `botId` 未定义变量 — 下注积分记录失败
+本次审计基于 v1 报告（2026-02-24）的基础上进行了全面复查。v1 中发现的部分问题已修复，同时发现了新的问题。
 
-- **文件**: `src/App.tsx:977`
-- **类别**: 代码 Bug
-- **状态**: 当前正在影响线上功能
-
-下注成功后调用 `/api/score/bet` 时，传入了未定义的 `botId` 变量：
-
-```javascript
-// 当前代码 (bug)
-body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId }),
-
-// 应改为
-body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName }),
-```
-
-`botId` 在该作用域内不存在（只有 `botName` 和 `botIdBytes32`），导致传入 `undefined`。后端虽然不会报错，但积分记录中的 botId 字段为空，无法追溯是哪个 bot 的下注。
-
-**修复方案**: 将 `botId` 改为 `botName`。
+| 严重度 | 数量 | 已修复 |
+|--------|------|--------|
+| 🔴 Critical | 3 | 0 |
+| 🟠 High | 8 | 1 |
+| 🟡 Medium | 9 | 0 |
+| 🟢 Low | 7 | 0 |
+| **总计** | **27** | **1** |
 
 ---
 
-### C2. 积分注册奖励并发竞态 — 可重复领取
+## v1 报告修复状态
 
-- **文件**: `server.js` `awardScore` / 注册流程
-- **类别**: 竞态条件 / 经济漏洞
-
-注册奖励的检查和发放不是原子操作：
-
-```javascript
-const alreadyClaimed = adUser && adUser.history.some(h => h.type === 'register');
-if (!alreadyClaimed) {
-    awardScore(ownerAddr, 'register', REGISTER_BONUS, {});  // +200
-}
-```
-
-两个并发的 `/api/bot/register` 请求可以同时通过 `alreadyClaimed` 检查（两个请求都读到 history 里还没有 `register` 记录），然后各自发放 200 积分。
-
-**利用方式**: 用脚本同时发送 2-5 个注册请求 → 每个都拿到 200 积分 → 一次注册获得 400-1000 积分。
-
-**修复方案**: 在 `awardScore` 内部用同步锁或在写入前再次检查。简单方案：在 `ensureScoreUser` 后立即设置一个 `claiming` 标记。
+| v1 ID | 问题 | 状态 |
+|-------|------|------|
+| C1 | botId 未定义变量 | ✅ 已修复 |
+| C2 | 积分注册竞态 | ⚠️ 未修复 |
+| C3 | Bot credit 扣减竞态 | ⚠️ 未修复 |
+| H1 | Bot 脚本验证正则绕过 | ⚠️ 未修复 |
+| H2 | Edit token 使用后不销毁 | ⚠️ 未修复 |
+| H4 | USDC 无限授权 | ⚠️ 未修复 |
+| H8 | 前端硬编码 gas 值 | ✅ 已修复（8处），🔧 本次修复最后1处 |
 
 ---
 
-### C3. Bot credit 扣减竞态 — 绕过试用次数限制
+## 🔴 Critical (3) — 新发现
 
-- **文件**: `server.js:1886-1893`
-- **类别**: 竞态条件
+### C-1: matchNumber 碰撞风险 — admin reset 不重置 nextMatch
+**文件**: `server.js` ~行 3510 (`/api/admin/room/:roomId/reset`)
+**描述**: Admin reset 端点将房间状态重置为 COUNTDOWN，但不清除 `this.nextMatch`。如果在 PLAYING 阶段 reset，`nextMatch` 中预创建的 matchId 仍然存在，而 `startCountdown()` 又会消费它，但此时链上的 `createMatch` 可能对应的是已被 reset 的比赛时间。
+**影响**: 链上 match 的 startTime 与实际游戏时间不匹配，导致投注窗口错误。
+**修复建议**: reset 时执行 `this.nextMatch = null`。
 
-```javascript
-if (botMeta.credits <= 0) return { ok: false, reason: 'trial_exhausted' };
-botMeta.credits -= 1;  // 非原子: 检查和扣减之间有窗口
-```
+### C-2: Admin create-on-chain 绕过 TX 队列
+**文件**: `server.js` ~行 3606 (`/api/admin/room/:roomId/create-on-chain`)
+**描述**: 直接调用 `pariMutuelContract.createMatch()` 而不经过 `enqueueTx()`，与队列中的其他交易可能产生 nonce 冲突。
+**影响**: 交易失败或 nonce gap 导致后续所有交易卡住。
+**修复建议**: 改用 `enqueueTxAsync()` 包装。
 
-**利用方式**: 一个只剩 1 次 credit 的 bot，同时发送 20 个 WebSocket join 请求 → 全部通过检查 → credit 被扣到 -19 → 获得 20 次免费游戏。
-
-**修复方案**: 在检查时直接扣减并检查结果：
-```javascript
-botMeta.credits -= 1;
-if (botMeta.credits < 0) { botMeta.credits += 1; return { ok: false }; }
-```
-
----
-
-## HIGH — 尽快修复
-
-### H1. Bot 脚本验证仅靠正则 — 可能被绕过
-
-- **文件**: `server.js:749-774`
-- **类别**: 沙盒安全
-
-禁止的模式（`require`, `eval`, `import` 等）只通过正则匹配检测：
-
-```javascript
-/\brequire\s*\(/,
-/\beval\s*\(/,
-/\bFunction\s*\(/,
-```
-
-可通过以下方式绕过：
-- 字符串拼接: `global['req' + 'uire']('fs')`
-- 方括号访问: `this.constructor.constructor('return process')()`
-- Unicode 转义: `\u0065val()`
-
-**修复方案**: 使用 AST 解析验证（如 `acorn`）代替正则，或依赖 `isolated-vm` 的沙盒隔离能力而非静态扫描。
+### C-3: matchNumber 未独立持久化
+**文件**: `server.js` ~行 640
+**描述**: `matchNumber` 在内存中维护。进程重启时从 `Math.floor(Date.now()/1000)` 重新生成。如果 PM2 crash loop（1秒内多次重启），可能生成相同 matchNumber。
+**影响**: 链上 matchId 碰撞 → `createMatch` revert。
+**修复建议**: 将 `matchNumber` 写入持久化文件，重启时读取并递增。
 
 ---
 
-### H2. Edit token 使用后不销毁 — 1 小时内可反复使用
+## 🟠 High (8)
 
-- **文件**: `server.js` edit-token 逻辑
-- **类别**: 认证漏洞
+### H-1: ✅ 已修复 — 遗漏的硬编码 gas (App.tsx handleCancel)
+**文件**: `src/App.tsx` ~行 1952
+**描述**: `MarketplacePage` 的 `handleCancel` 函数中有 `gas: 200_000n` 硬编码。
+**状态**: ✅ 本次已移除。
 
-Edit token 创建后存在 `editTokens` Map 中，有效期 1 小时。但上传代码后 token 不被删除，在整个有效期内可以反复修改 bot 代码。
+### H-2: 积分注册奖励并发竞态（v1 C2 未修复）
+**文件**: `server.js` 注册流程
+**描述**: 两个并发 `/api/bot/register` 请求可同时通过 `alreadyClaimed` 检查，各自发放 200 积分。
+**利用方式**: 脚本同时发 2-5 个注册请求 → 一次注册获 400-1000 积分。
+**修复建议**: 在 `awardScore` 内部用同步标记或原子检查。
 
-**修复方案**: 在 `/api/bot/upload` 成功后调用 `editTokens.delete(token)`。
+### H-3: Bot credit 扣减竞态（v1 C3 未修复）
+**文件**: `server.js` ~行 1886
+**描述**: `credits <= 0` 检查和 `credits -= 1` 非原子操作。
+**利用方式**: bot 只剩 1 credit，同时发 20 个 join 请求 → credit 被扣到 -19。
+**修复建议**: 先扣后检查：`credits -= 1; if (credits < 0) { credits += 1; return fail; }`
 
----
+### H-4: displayIdToMatchId 无限增长
+**文件**: `server.js` ~行 654
+**描述**: `displayIdToMatchId` 对象只增不减，永远不会清理旧条目。
+**影响**: 内存泄漏（缓慢但持续）。
+**修复建议**: 使用 LRU 缓存或定期清理超过 N 天的条目。
 
-### H3. 付费参赛不验证 Bot 所有权
+### H-5: usedEntryTxHashes 永不清理
+**文件**: `server.js` ~行 651
+**描述**: `usedEntryTxHashes` Set 用于防止重放攻击，但从不删除旧条目。
+**影响**: 与 H-4 类似的内存泄漏。
+**修复建议**: 定期清理超过 24 小时的条目（需配合时间戳记录）。
 
-- **文件**: `server.js:2881-2962`
-- **类别**: 经济漏洞
+### H-6: Credits 先扣后确认
+**文件**: `server.js` ~行 2758 (`handleCompetitiveEntry`)
+**描述**: 竞技场入场先扣 credits，然后才检查空位。无空位时 credits 已扣但未入场。
+**影响**: 用户丢失 credits。
+**修复建议**: 先检查空位再扣除；或失败时回滚。
 
-`/api/competitive/enter` 只检查 bot 是否存在于 `botRegistry`，不检查调用者是否拥有该 bot 的 NFT。
+### H-7: /api/score 和 /api/bet 端点缺少认证
+**文件**: `server.js` ~行 3200-3300
+**描述**: 这些端点无认证，任何人可调用。
+**影响**: 潜在作弊风险。
+**修复建议**: 添加 API key 或 HMAC 签名验证。
 
-**利用方式**: 任何人可以为别人的 bot 付费报名，导致原主人的 bot 被强制加入比赛。
-
-**修复方案**: 验证 TX 发送者 === bot NFT 的 `ownerOf`。
-
----
-
-### H4. USDC 无限授权
-
-- **文件**: `src/App.tsx:948`
-- **类别**: 资产安全
-
-```javascript
-const maxApproval = BigInt('0xfff...fff');
-args: [CONTRACTS.pariMutuel, maxApproval],
-```
-
-授权了无限 USDC 额度给 PariMutuel 合约。如果合约存在漏洞或被攻击，用户钱包中的**全部 USDC** 都有风险。
-
-**修复方案**: 改为只授权当前下注金额：`args: [CONTRACTS.pariMutuel, usdcAmount]`。
-
----
-
-### H5. displayMatchId 每日重置碰撞
-
-- **文件**: `server.js:587-590`
-- **类别**: 逻辑 Bug
-
-P1/A1 编号每天从 1 重置。`displayIdToMatchId` 映射只保留最近 200 条。当用户查询 "P5" 时，可能返回今天的 P5 也可能返回昨天的 P5（如果缓存中恰好还在）。
-
-影响回放查询、投注匹配。
-
-**修复方案**: displayId 加入日期元素，如 `P0224-5`（2月24日第5场 performance），或使用全局唯一 ID。
+### H-8: settledOnChainMatchIds O(n) 查找
+**文件**: `server.js` ~行 648
+**描述**: `settledOnChainMatchIds` 是数组，使用 `.includes()` 查找。
+**影响**: 随比赛增多性能下降。
+**修复建议**: 改为 `Set`。
 
 ---
 
-### H6. 付费参赛记录未持久化
+## 🟡 Medium (9)
 
-- **文件**: `server.js:2946`
-- **类别**: 数据完整性
+### M-1: saveHistory 中调用 nextMatchId() — ID 双重消耗
+**文件**: `server.js` ~行 1640
+**描述**: `saveHistory()` 调用 `nextMatchId()` 导致 matchId 跳跃。
+**修复建议**: 使用独立的 historyId 生成器。
 
-`room.paidEntries` 只存在内存中。服务器重启 → 所有付费参赛记录丢失 → 用户付了 ETH 但 bot 未入场。
+### M-2: 同步 I/O 在热路径
+**文件**: `server.js` 多处 (`saveCounters`, `saveCredits` 等)
+**描述**: `fs.writeFileSync` 阻塞事件循环。
+**修复建议**: 改用 `fs.promises.writeFile` + debounce。
 
-**修复方案**: 将 `paidEntries` 持久化到 `DATA_DIR/paid-entries.json`，启动时恢复。
+### M-3: Bot 脚本存放在代码目录
+**文件**: `server.js` ~行 610 (`BOT_SCRIPTS_DIR`)
+**描述**: `./bot-scripts` 与代码混在一起，部署时可能被覆盖。
+**修复建议**: 移到 `/root/snake-data/bot-scripts`。
 
----
+### M-4: Edit token 30 分钟窗口过长
+**文件**: `server.js` ~行 2525
+**描述**: token 有效期 30 分钟，使用后不销毁。
+**修复建议**: 缩短到 5 分钟 + 使用后销毁。
 
-### H7. JSON 数据文件加载无容错
+### M-5: Prediction regex 脆弱性
+**文件**: `src/App.tsx` ~行 2100
+**描述**: 前端用正则匹配 displayMatchId 格式，格式变化会导致匹配失败。
+**修复建议**: 后端直接返回 matchId 数字。
 
-- **文件**: `server.js:229, 267, 540, 560`
-- **类别**: 可用性
+### M-6: WebSocket 无心跳超时
+**文件**: `server.js` WebSocket 处理
+**描述**: 没有 ping/pong 机制检测断开的连接。
+**修复建议**: 实现 30 秒间隔 ping/pong。
 
-```javascript
-referralData = JSON.parse(fs.readFileSync(REFERRAL_DATA_FILE, 'utf8'));
-```
+### M-7: 链上结算失败无重试
+**文件**: `server.js` ~行 1790
+**描述**: `settleMatch` 失败后不重试。
+**修复建议**: 添加指数退避重试。
 
-如果文件损坏（磁盘满写入截断、意外中断等），`JSON.parse` 抛异常 → 服务器无法启动 → 完全宕机。
+### M-8: 前端轮询间隔不协调
+**文件**: `src/App.tsx` 多处
+**描述**: 多个 `setInterval` 硬编码且不协调。
+**修复建议**: 统一轮询管理 + 可见性 API。
 
-当前受影响的文件：`referrals.json`, `score.json`, `history.json`, `match_counters.json`。
-
-**修复方案**: 每个文件加载都用 try-catch 包裹，失败时回退到空数据并记录告警。
-
----
-
-### H8. WebSocket 消息无 schema 验证
-
-- **文件**: `src/App.tsx:1182`
-- **类别**: 前端健壮性
-
-```javascript
-const msg = JSON.parse(e.data);
-if (msg.type === 'update') render(msg.state);  // 不验证 state 结构
-```
-
-如果服务端发来格式异常的 state（缺少 players 数组、坐标为负数等），canvas 渲染会崩溃，但错误被静默吞掉，用户只看到画面冻结。
-
-**修复方案**: 在渲染前做基本的 schema 检查（`state.players` 是数组、`state.food` 是数组等），异常时显示错误提示。
-
----
-
-## MEDIUM — 应该修复
-
-### M1. 无 CORS 配置
-
-- **文件**: `server.js` Express 初始化
-- **类别**: Web 安全
-
-Express 没有配置 CORS 中间件。默认允许任何域名的 JavaScript 向 API 发请求。恶意网站可以在用户不知情的情况下调用 API（如签到、查询积分等）。
-
-**修复方案**: 添加 `cors` 中间件，白名单只允许自己的域名。
+### M-9: 多个 useEffect 缺少清理
+**文件**: `src/App.tsx` 多处
+**描述**: 部分 `setInterval` 和事件监听器未正确清理。
+**修复建议**: 确保每个 useEffect 都有对应清理。
 
 ---
 
-### M2. 签名验证时间窗口 5 分钟
+## 🟢 Low (7)
 
-- **文件**: `server.js` 多处签名验证
-- **类别**: 重放攻击
+### L-1: 单一 RPC 端点
+服务端仅使用一个 Base Sepolia RPC，无故障转移。
 
-签到、编辑 token、claim 等功能的签名验证时间窗口为 5 分钟。如果签名被截获，攻击者有 5 分钟可以重放。
+### L-2: guideUrl 可能 404
+指向外部文档的链接未验证可用性。
 
-影响端点：`/api/bot/edit-token`, `/api/bot/claim`, `/api/score/checkin`, `/api/score/claim-register`。
+### L-3: decodeBytes32String 可能抛异常
+部分 `ethers.decodeBytes32String()` 调用未被 try-catch 包裹。
 
-**修复方案**: 缩短窗口到 60 秒，并记录已使用的签名防止重放。
+### L-4: 前端 WebSocket 重连无上限
+断开后自动重连但无最大重试限制。
 
----
+### L-5: console.log 残留
+大量调试语句残留在生产代码中。
 
-### M3. 推荐记录 TX 验证不严格
+### L-6: 环境变量无启动时校验
+缺少对 `PRIVATE_KEY`、`RPC_URL` 等必要变量的检查。
 
-- **文件**: `server.js:4072-4106`
-- **类别**: 经济漏洞
-
-推荐记录只检查 TX 目标地址是 BotRegistry，不检查是否真的是 `registerBot` 函数调用。任何发到 BotRegistry 合约的 TX（包括只读调用产生的 TX）都能通过验证。
-
-**修复方案**: 解析 TX data 前 4 字节，验证是 `registerBot` 的 function selector。
-
----
-
-### M4. Player name 潜在 XSS
-
-- **文件**: `src/App.tsx:2497`
-- **类别**: XSS（低风险）
-
-```jsx
-<span className="fighter-name">{p.name}</span>
-```
-
-React 默认会转义 HTML，所以实际风险低。但如果未来有人改用 `dangerouslySetInnerHTML` 或在其他上下文使用 player name，风险会升高。
-
-**修复方案**: 服务端在广播 state 时对 name 做 sanitize。
+### L-7: CORS 配置过于宽松
+允许所有来源 (`*`)。
 
 ---
 
-### M5. userScores 内存无限增长
+## 优先修复建议
 
-- **文件**: `server.js:300`
-- **类别**: 内存泄漏
+### 🔥 立即修复 (今天)
+1. ✅ **H-1**: 移除 App.tsx handleCancel 硬编码 gas — **已修复**
+2. **C-2**: admin create-on-chain 改用 `enqueueTxAsync()`（5 分钟）
+3. **H-8**: `settledOnChainMatchIds` 改为 Set（2 分钟）
 
-每个签到过的用户都永久保留在 `userScores` 对象中，无清理机制。每个用户对象包含 total、checkin、最多 100 条 history。
+### ⚡ 短期修复 (本周)
+4. **C-1**: admin reset 清除 nextMatch
+5. **C-3**: matchNumber 持久化
+6. **H-2**: 注册奖励竞态修复
+7. **H-3**: credit 扣减竞态修复
+8. **H-6**: credits 先检查后扣除
 
-当用户量达到数万时，`score.json` 文件和内存占用会持续增长。
-
-**修复方案**: 定期清理超过 30 天未活跃的用户数据，或改用数据库。
-
----
-
-### M6. replayFrames 未及时释放
-
-- **文件**: `server.js` Room 类
-- **类别**: 内存
-
-比赛结束后 `replayFrames` 数组写入文件，但数组引用在 Room 对象中保留到下一场比赛开始才清空。4 个房间同时保留上一场的帧数据 → 额外数十 MB 内存占用。
-
-**修复方案**: `saveReplay()` 完成后立即 `this.replayFrames = []`。
-
----
-
-### M7. NFT 购买者可下载 Bot 源码
-
-- **文件**: `server.js:2806-2834`
-- **类别**: 知识产权
-
-edit-token 验证的是 NFT 持有者身份。如果用户 A 创建了 bot，用户 B 在市场上购买了 NFT，B 就可以获取 edit-token 并下载 A 写的全部源码。
-
-这可能不是 bug 而是 feature（NFT = 完整所有权），但需要明确产品设计意图。
-
-**如果不希望源码随 NFT 转让**: 记录原始创建者地址，只有创建者能获取 edit-token。
-
----
-
-### M8. 部分 API 缺少限频
-
-- **文件**: `server.js` 多个 GET 端点
-- **类别**: DoS 防护
-
-以下端点没有 rate limit：
-- `GET /api/portfolio`（包含链上查询，较重）
-- `GET /api/bot/:botId`
-- `GET /api/user/bots`
-- `GET /api/marketplace/listings`（包含链上查询）
-- `GET /api/pari-mutuel/claimable`（包含链上查询）
-
-**修复方案**: 对包含链上查询的端点加 rate limit（如 10 req/min/IP）。
-
----
-
-## LOW — 有空时优化
-
-### L1. `Math.random()` 生成 ID
-
-- **文件**: `server.js` 多处
-- `Math.random()` 不是密码学安全的随机源。对于游戏内 player ID 风险低，但如果用于任何安全敏感场景应改用 `crypto.randomBytes()`。
-
-### L2. 前端 Leaderboard 30 秒刷新
-
-- **文件**: `src/App.tsx:2392`
-- 实时对战游戏中 30 秒刷新太慢，建议降到 10 秒。
-
-### L3. NFT Approval 等待最多 20 秒
-
-- **文件**: `src/App.tsx:596-607`
-- 出售 Bot 时等待 NFT approval 确认最多轮询 10 次 × 2 秒 = 20 秒。网络拥堵时可能不够，导致后续 list 交易失败。建议增加到 30 次或用 receipt 等待。
-
-### L4. 列表渲染用 array index 做 key
-
-- **文件**: `src/App.tsx` 多处 `.map((item, i) => <li key={i}>)`
-- 当列表顺序变化时导致不必要的 DOM 重建。建议用 `address` 或 `botId` 做 key。
-
-### L5. WebSocket 重连可能产生多连接
-
-- **文件**: `src/App.tsx:1162-1189`
-- 快速切换 Performance/Competitive 页面时，旧的重连定时器可能在组件卸载后触发，创建重复连接。cleanup 函数设置了 `destroyed=true` 但 setTimeout 回调中的检查可能有竞态。
+### 📋 中期优化 (下周)
+9. **H-4/H-5**: 内存数据定期清理
+10. **M-2**: 异步文件 I/O
+11. **M-6**: WebSocket 心跳
+12. **M-4**: edit token 缩短 + 使用后销毁
