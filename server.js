@@ -686,18 +686,21 @@ async function _drainTxQueue() {
                 if (resolve) resolve(result);
             } catch (e) {
                 const attempt = retries || 0;
-                const isRetryable = label.startsWith('createMatch') || label.startsWith('settleMatch');
+                const reason = e.reason || e.message || '';
                 // "already exists" / "already settled" means the original TX succeeded but response was lost
-                const alreadyDone = e.reason && (e.reason.includes('already exists') || e.reason.includes('already settled'));
+                const alreadyDone = reason.includes('already exists') || reason.includes('already settled');
+                // Hopeless errors — will never succeed, don't waste time retrying
+                const isHopeless = reason.includes('does not exist') || reason.includes('Match cancelled');
+                const isRetryable = (label.startsWith('createMatch') || label.startsWith('settleMatch')) && !isHopeless;
                 if (alreadyDone) {
                     log.info(`[TxQueue] ${label} already done on-chain, treating as success`);
                     if (resolve) resolve(null);
                 } else if (isRetryable && attempt < 3) {
-                    log.warn(`[TxQueue] ${label} failed (attempt ${attempt + 1}/3), retrying in 5s: ${e.message}`);
-                    await new Promise(r => setTimeout(r, 5000));
-                    _txQueue.unshift({ label, fn, resolve, reject, retries: attempt + 1 });
+                    log.warn(`[TxQueue] ${label} failed (attempt ${attempt + 1}/3), will retry: ${reason}`);
+                    // Push to BACK of queue (not unshift!) so other TXs can process
+                    _txQueue.push({ label, fn, resolve, reject, retries: attempt + 1 });
                 } else {
-                    log.warn(`[TxQueue] ${label} failed${isRetryable ? ' (gave up after 3 attempts)' : ''}: ${e.message}`);
+                    log.warn(`[TxQueue] ${label} failed${isHopeless ? ' (hopeless, skipped)' : isRetryable ? ' (gave up after 3 attempts)' : ''}: ${reason}`);
                     if (reject) reject(e);
                 }
             }
@@ -1873,9 +1876,10 @@ class GameRoom {
 
         if (pariMutuelContract) {
             const mid = nextMid;
-            const entry = this.nextMatch;
+            // Calculate startTime NOW (not in the callback) to avoid queue delay skewing it
+            // Next match starts after: current matchTimeLeft + GAMEOVER(5s) + COUNTDOWN(5s) ≈ +10s buffer
+            const startTime = Math.floor(Date.now() / 1000) + this.matchTimeLeft + 10;
             enqueueTx(`createMatch ${mid} (next)`, async (overrides) => {
-                const startTime = Math.floor(Date.now() / 1000) + this.matchTimeLeft + 10;
                 const tx = await pariMutuelContract.createMatch(mid, startTime, overrides);
                 await tx.wait();
                 log.important(`[Blockchain] createMatch #${mid} (next, startTime=${startTime}) confirmed`);

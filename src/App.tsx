@@ -505,8 +505,9 @@ function BotManagement() {
       setRegStatus('Waiting for on-chain confirmation...');
       await new Promise(r => setTimeout(r, 5000));
 
-      setRegStatus('Sign on-chain registration (0.01 ETH)...');
+      setRegStatus(`Sign on-chain registration (0.01 ETH)... [bot: ${data.id}, wallet: ${address}]`);
       const botId32 = nameToBytes32(data.id);
+      console.log('[Register] writeContractAsync params:', { botId: data.id, botId32, address: CONTRACTS.botRegistry, wallet: address });
       setRegPending(true);
       setRegError(null);
       try {
@@ -516,21 +517,24 @@ function BotManagement() {
           functionName: 'registerBot',
           args: [botId32, '0x0000000000000000000000000000000000000000' as `0x${string}`],
           value: parseEther('0.01'),
-          gas: 500_000n,
         });
         setRegHash(hash as `0x${string}`);
       } catch (e: any) {
         setRegError(e);
+        console.error('[Register] writeContractAsync error:', e);
         // Extract revert reason for better error message
         const reason = e?.cause?.reason || e?.shortMessage || e?.message || '';
+        const details = e?.cause?.shortMessage || e?.details || '';
         if (reason.includes('Max') && reason.includes('bots per user')) {
-          setRegStatus('⚠️ This wallet has reached the max bots limit on-chain. Use a different wallet.');
+          setRegStatus('⚠️ This wallet has reached the max bots limit (5) on-chain. Use a different wallet.');
         } else if (reason.includes('already registered')) {
           setRegStatus('⚠️ This bot is already registered on-chain.');
         } else if (reason.includes('user rejected') || reason.includes('denied')) {
           setRegStatus('Transaction cancelled.');
+        } else if (reason.includes('chain') || reason.includes('network') || reason.includes('switch')) {
+          setRegStatus('⚠️ Please switch your wallet to Base Sepolia network (chainId: 84532)');
         } else {
-          setRegStatus('⚠️ Registration failed: ' + (e?.shortMessage || e?.message || 'Unknown error'));
+          setRegStatus('⚠️ Registration failed: ' + (e?.shortMessage || e?.message || 'Unknown error') + (details ? ' | ' + details : ''));
         }
       }
       setRegPending(false);
