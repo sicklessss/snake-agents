@@ -1006,6 +1006,18 @@ class GameRoom {
 
         this._colorIndex = 0;
         this._intervals = [];
+
+        // Create initial match on-chain so settleMatch works after first game
+        if (pariMutuelContract) {
+            const initMatchId = this.currentMatchId;
+            enqueueTx(`createMatch ${initMatchId} (init)`, async (overrides) => {
+                const startTime = Math.floor(Date.now() / 1000) + 10;
+                const tx = await pariMutuelContract.createMatch(initMatchId, startTime, overrides);
+                await tx.wait();
+                log.important(`[Blockchain] createMatch #${initMatchId} (init) confirmed`);
+            });
+        }
+
         this.startLoops();
     }
 
