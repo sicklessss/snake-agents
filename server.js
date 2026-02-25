@@ -2591,33 +2591,25 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         }
         log.important('[Register] Bot ' + botMeta.name + ' (' + botId + ') claimed via regCode by ' + (owner || 'unknown'));
 
-        // Ensure bot exists on-chain (same as non-regCode path)
-        let onChainOk = false;
+        // Create bot on-chain in background (don't block HTTP response)
         if (botRegistryContract) {
             const botIdBytes32 = ethers.encodeBytes32String(botId);
-            try {
-                const existing = await botRegistryContract.getBotById(botIdBytes32);
-                if (existing && existing.botId === botIdBytes32) {
-                    onChainOk = true;
-                }
-            } catch (e) { /* not on-chain yet */ }
-            if (!onChainOk) {
+            (async () => {
                 try {
-                    await enqueueTxAsync(`createBot ${botId}`, async (overrides) => {
-                        const tx = await botRegistryContract.createBot(
-                            botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides
-                        );
-                        await tx.wait(1, 60000);
-                        log.important(`[Blockchain] Bot ${botId} created on-chain via regCode claim`);
-                    });
-                    onChainOk = true;
-                } catch (err) {
-                    log.warn('[Blockchain] Failed to create bot on-chain via regCode:', err.message);
-                }
-            }
+                    const existing = await botRegistryContract.getBotById(botIdBytes32);
+                    if (existing && existing.botId === botIdBytes32) return; // already on-chain
+                } catch (_) {}
+                enqueueTx(`createBot ${botId}`, async (overrides) => {
+                    const tx = await botRegistryContract.createBot(
+                        botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides
+                    );
+                    await tx.wait(1, 60000);
+                    log.important(`[Blockchain] Bot ${botId} created on-chain via regCode claim`);
+                });
+            })();
         }
 
-        return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: onChainOk });
+        return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
     }
 
     const safeName = (name || 'AgentBot').toString().slice(0, MAX_NAME_LEN);
@@ -2668,38 +2660,29 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         saveBotRegistry();
     }
 
-    // Ensure bot exists on-chain (BLOCKING — wait for confirmation before responding)
-    let onChainOk = false;
+    // Create bot on-chain in background (don't block HTTP response)
+    let onChainOk = true; // optimistic — will be created in background
     if (botRegistryContract) {
         const botIdBytes32 = ethers.encodeBytes32String(id);
-        // First check if bot already exists on-chain (e.g. created during upload)
-        try {
-            const existing = await botRegistryContract.getBotById(botIdBytes32);
-            if (existing && existing.botId === botIdBytes32) {
-                log.important(`[Blockchain] Bot ${id} already exists on-chain, skipping createBot`);
-                onChainOk = true;
-            }
-        } catch (e) {
-            // getBotById reverted = bot doesn't exist yet, that's fine
-        }
-        // If not on-chain yet, create it via TX queue (prevents nonce collisions)
-        if (!onChainOk) {
+        (async () => {
             try {
-                await enqueueTxAsync(`createBot ${id}`, async (overrides) => {
-                    const tx = await botRegistryContract.createBot(
-                        botIdBytes32,
-                        safeName,
-                        ethers.ZeroAddress,
-                        overrides
-                    );
-                    await tx.wait(1, 60000);
-                    log.important(`[Blockchain] Bot ${id} created on-chain via /register`);
-                });
-                onChainOk = true;
-            } catch (err) {
-                log.warn('[Blockchain] Failed to create bot on-chain via /register:', err.message);
-            }
-        }
+                const existing = await botRegistryContract.getBotById(botIdBytes32);
+                if (existing && existing.botId === botIdBytes32) {
+                    log.important(`[Blockchain] Bot ${id} already exists on-chain, skipping createBot`);
+                    return;
+                }
+            } catch (_) {}
+            enqueueTx(`createBot ${id}`, async (overrides) => {
+                const tx = await botRegistryContract.createBot(
+                    botIdBytes32,
+                    safeName,
+                    ethers.ZeroAddress,
+                    overrides
+                );
+                await tx.wait(1, 60000);
+                log.important(`[Blockchain] Bot ${id} created on-chain via /register`);
+            });
+        })();
     }
 
     // Award registration bonus (once per wallet, atomic check-and-set to prevent race condition)
@@ -3299,24 +3282,19 @@ app.post('/api/bot/upload', rateLimit({ windowMs: 60_000, max: 10 }), async (req
         if (owner && !botRegistry[targetBotId].owner) botRegistry[targetBotId].owner = owner;
         saveBotRegistry();
 
-        // 4. Create bot on-chain via TX queue (if new bot)
+        // 4. Create bot on-chain in background (don't block HTTP response)
         if (botRegistryContract && !botId) {
-            try {
-                const botName = botRegistry[targetBotId].name;
-                await enqueueTxAsync(`createBot ${targetBotId}`, async (overrides) => {
-                    const tx = await botRegistryContract.createBot(
-                        ethers.encodeBytes32String(targetBotId),
-                        botName,
-                        ethers.ZeroAddress,
-                        overrides
-                    );
-                    await tx.wait(1, 60000);
-                    log.important(`[Blockchain] Bot ${targetBotId} created on-chain`);
-                });
-            } catch (chainErr) {
-                log.warn('[Blockchain] Failed to create bot on-chain:', chainErr.message);
-                // Non-blocking: bot still works locally even if chain fails
-            }
+            const botName = botRegistry[targetBotId].name;
+            enqueueTx(`createBot ${targetBotId}`, async (overrides) => {
+                const tx = await botRegistryContract.createBot(
+                    ethers.encodeBytes32String(targetBotId),
+                    botName,
+                    ethers.ZeroAddress,
+                    overrides
+                );
+                await tx.wait(1, 60000);
+                log.important(`[Blockchain] Bot ${targetBotId} created on-chain`);
+            });
         }
 
         // Auto-assign/kick rule: each uploaded agent bot kicks one normal bot
