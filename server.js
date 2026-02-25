@@ -569,24 +569,32 @@ function nextMatchId() {
     return id;
 }
 
-// Per-type display counters (persisted, reset daily at UTC midnight)
+// Per-room display counters (persisted) — A1, B3, P1...
 const COUNTERS_FILE = path.join(DATA_DIR, 'match_counters.json');
-let perfMatchCounter = 1;
-let compMatchCounter = 1;
-let lastResetDate = new Date().toISOString().slice(0, 10);
+const ROOM_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+let roomCounters = { A: 1, B: 1, C: 1, D: 1, E: 1, F: 1, P: 1 };
 if (fs.existsSync(COUNTERS_FILE)) {
     try {
         const saved = JSON.parse(fs.readFileSync(COUNTERS_FILE));
-        perfMatchCounter = saved.perfMatchCounter || 1;
-        compMatchCounter = saved.compMatchCounter || 1;
-        lastResetDate = saved.lastResetDate || lastResetDate;
-        log.important(`[Counters] Restored: P${perfMatchCounter}, A${compMatchCounter}, date=${lastResetDate}`);
+        // Migration: carry forward old counters if present
+        if (saved.A !== undefined) {
+            roomCounters = { ...roomCounters, ...saved };
+        } else {
+            // Legacy format — migrate perfMatchCounter/compMatchCounter
+            if (saved.perfMatchCounter) {
+                // Old perf counter was shared across all rooms, start all room counters from it
+                const base = saved.perfMatchCounter;
+                ROOM_LETTERS.forEach(l => { roomCounters[l] = base; });
+            }
+            if (saved.compMatchCounter) roomCounters.P = saved.compMatchCounter;
+        }
+        log.important(`[Counters] Restored: ${JSON.stringify(roomCounters)}`);
     } catch (e) { log.warn('[Counters] Failed to load:', e.message); }
 }
 function saveCounters() {
     try {
         const tmp = COUNTERS_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify({ perfMatchCounter, compMatchCounter, lastResetDate }));
+        fs.writeFileSync(tmp, JSON.stringify(roomCounters));
         fs.renameSync(tmp, COUNTERS_FILE);
     } catch (e) { log.warn('[Counters] Failed to save:', e.message); }
 }
@@ -602,11 +610,15 @@ function getCurrentEpoch() {
 // Map displayMatchId → numeric matchId (for pool lookup)
 const displayIdToMatchId = {};
 
-function getNextDisplayId(type) {
-    // Global counter (never resets) — keeps IDs short: P259, A47
-    const displayId = type === 'competitive'
-        ? ('A' + compMatchCounter++)
-        : ('P' + perfMatchCounter++);
+function getNextDisplayId(type, letter) {
+    if (type === 'competitive') {
+        const displayId = 'P' + roomCounters.P++;
+        saveCounters();
+        return displayId;
+    }
+    // Performance: use room letter (A, B, C...)
+    const key = letter || 'A';
+    const displayId = key + roomCounters[key]++;
     saveCounters();
     return displayId;
 }
@@ -682,11 +694,11 @@ async function _drainTxQueue() {
     }
 }
 
+let lastResetDate = new Date().toISOString().slice(0, 10);
 function checkDailyReset() {
     const today = new Date().toISOString().slice(0, 10);
     if (today !== lastResetDate) {
         lastResetDate = today;
-        // Counters no longer reset — global IDs (P259, A47) must be unique across days
         saveCounters();
         for (const [, room] of rooms) {
             if (room.type === 'competitive') {
@@ -735,7 +747,7 @@ const SPAWN_POINTS = [
 ];
 
 const ROOM_LIMITS = {
-    performance: 10,
+    performance: 6,
     competitive: 2,
 };
 const ROOM_MAX_PLAYERS = {
@@ -961,9 +973,10 @@ function randomDirection() {
 }
 
 class GameRoom {
-    constructor({ id, type }) {
+    constructor({ id, type, letter }) {
         this.id = id;
         this.type = type; // performance | competitive
+        this.letter = letter || null; // 'A'-'F' for performance, null for competitive
         this.maxPlayers = ROOM_MAX_PLAYERS[type] || 10;
         this.clients = new Set();
 
@@ -978,8 +991,9 @@ class GameRoom {
         this.winner = null;
         this.timerSeconds = 5;
         this.currentMatchId = nextMatchId();
-        this.displayMatchId = getNextDisplayId(type);
+        this.displayMatchId = getNextDisplayId(type, letter);
         registerDisplayId(this.displayMatchId, this.currentMatchId);
+        this.nextMatch = null; // { matchId, displayMatchId }
         this.victoryPauseTimer = 0;
         this.lastSurvivorForVictory = null;
         this.replayFrames = []; // Record frames for replay
@@ -1722,21 +1736,27 @@ class GameRoom {
         }
 
         this.players = {};
-        this.currentMatchId = nextMatchId();
-        this.displayMatchId = getNextDisplayId(this.type);
-        registerDisplayId(this.displayMatchId, this.currentMatchId);
-        this.victoryPauseTimer = 0;
-
-        // Create match on-chain (PariMutuel USDC contract) — fire-and-forget
-        if (pariMutuelContract) {
-            const onChainMatchId = this.currentMatchId;
-            enqueueTx(`createMatch ${onChainMatchId}`, async (overrides) => {
-                // Use minimal future offset to avoid "Match not started" race with settleMatch
-                const startTime = Math.floor(Date.now() / 1000) + 5;
-                const tx = await pariMutuelContract.createMatch(onChainMatchId, startTime, overrides);
-                await tx.wait();
-                log.important(`[Blockchain] createMatch #${onChainMatchId} (startTime=${startTime}) confirmed`);
-            });
+        // Consume pre-created nextMatch if available
+        if (this.nextMatch) {
+            this.currentMatchId = this.nextMatch.matchId;
+            this.displayMatchId = this.nextMatch.displayMatchId;
+            this.nextMatch = null;
+            log.important(`[Room ${this.id}] Using pre-created match #${this.currentMatchId} (${this.displayMatchId})`);
+        } else {
+            // Fallback: create immediately
+            this.currentMatchId = nextMatchId();
+            this.displayMatchId = getNextDisplayId(this.type, this.letter);
+            registerDisplayId(this.displayMatchId, this.currentMatchId);
+            // Create match on-chain
+            if (pariMutuelContract) {
+                const onChainMatchId = this.currentMatchId;
+                enqueueTx(`createMatch ${onChainMatchId}`, async (overrides) => {
+                    const startTime = Math.floor(Date.now() / 1000) + 5;
+                    const tx = await pariMutuelContract.createMatch(onChainMatchId, startTime, overrides);
+                    await tx.wait();
+                    log.important(`[Blockchain] createMatch #${onChainMatchId} (startTime=${startTime}) confirmed`);
+                });
+            }
         }
         this.lastSurvivorForVictory = null;
         this.matchTimeLeft = MATCH_DURATION;
@@ -1830,7 +1850,23 @@ class GameRoom {
         this.matchTimeLeft = MATCH_DURATION;
         this.sendEvent('match_start', { matchId: this.currentMatchId, arenaId: this.id, arenaType: this.type });
 
-        // Note: SnakeAgentsBetting contract does not require createMatch — bets are placed directly by matchId
+        // Pre-create next match (so users can bet on it during PLAYING)
+        const nextMid = nextMatchId();
+        const nextDispId = getNextDisplayId(this.type, this.letter);
+        registerDisplayId(nextDispId, nextMid);
+        this.nextMatch = { matchId: nextMid, displayMatchId: nextDispId };
+        log.important(`[Room ${this.id}] Pre-created next match #${nextMid} (${nextDispId})`);
+
+        if (pariMutuelContract) {
+            const mid = nextMid;
+            const entry = this.nextMatch;
+            enqueueTx(`createMatch ${mid} (next)`, async (overrides) => {
+                const startTime = Math.floor(Date.now() / 1000) + this.matchTimeLeft + 10;
+                const tx = await pariMutuelContract.createMatch(mid, startTime, overrides);
+                await tx.wait();
+                log.important(`[Blockchain] createMatch #${mid} (next, startTime=${startTime}) confirmed`);
+            });
+        }
     }
 
     broadcastState() {
@@ -1880,6 +1916,10 @@ class GameRoom {
             obstacles: this.type === 'competitive' ? this.obstacles : [],
             matchNumber: this.matchNumber || 1,
             displayMatchId: this.displayMatchId,
+            nextMatch: this.nextMatch ? {
+                matchId: this.nextMatch.matchId,
+                displayMatchId: this.nextMatch.displayMatchId,
+            } : null,
             epoch: getCurrentEpoch(),
             victoryPause: this.victoryPauseTimer > 0,
             victoryPauseTime: Math.ceil(this.victoryPauseTimer / 8),
@@ -2028,18 +2068,22 @@ const performanceRooms = [];
 const competitiveRooms = [];
 
 function createRoom(type) {
-    const index = type === 'performance' ? performanceRooms.length + 1 : competitiveRooms.length + 1;
-    const id = `${type}-${index}`;
-    const room = new GameRoom({ id, type });
-    rooms.set(id, room);
     if (type === 'performance') {
+        const letter = ROOM_LETTERS[performanceRooms.length];
+        const id = `performance-${letter}`;
+        const room = new GameRoom({ id, type, letter });
+        rooms.set(id, room);
         performanceRooms.push(room);
-        // Default: fill with normal bots
         seedNormalBots(room, ROOM_MAX_PLAYERS.performance);
+        return room;
     } else {
+        const index = competitiveRooms.length + 1;
+        const id = `${type}-${index}`;
+        const room = new GameRoom({ id, type });
+        rooms.set(id, room);
         competitiveRooms.push(room);
+        return room;
     }
-    return room;
 }
 
 // init rooms

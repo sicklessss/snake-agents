@@ -864,7 +864,7 @@ function BotManagement() {
 }
 
 // Prediction — on-chain USDC betting via SnakeAgentsPariMutuel contract
-function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: string | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
+function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string } | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
   const { isConnected, address } = useAccount();
   const { writeContractAsync } = useWriteContract();
   const [botName, setBotName] = useState('');
@@ -879,7 +879,7 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
 
   const handlePredict = async () => {
     const input = targetMatch.trim().toUpperCase();
-    if (!/^[PA]\d+$/.test(input)) return alert('请输入比赛编号，如 P5 或 A3');
+    if (!/^[A-FP]\d+$/.test(input)) return alert('请输入比赛编号，如 A5 或 P3');
     let mid: number;
     try {
       const r = await fetch('/api/match/by-display-id?id=' + encodeURIComponent(input));
@@ -923,7 +923,7 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
           args: [BigInt(mid)],
         }) as any;
         if (!matchData || matchData[0] === 0n) {
-          setStatus('❌ 该比赛尚未在链上创建 — 请等待新比赛开始后再下注');
+          setStatus('⏳ 该比赛正在链上创建中，请稍等几秒后重试');
           setBusy(false);
           return;
         }
@@ -1017,7 +1017,21 @@ function Prediction({ displayMatchId, epoch, arenaType }: { displayMatchId: stri
   return (
     <div className="panel-card">
       <div className="panel-row"><span>当前比赛</span><span>{displayMatchId ? `Epoch ${epoch} #${displayMatchId}` : '--'}</span></div>
-      <input placeholder="比赛编号 (如 P5, A3)" value={targetMatch} onChange={e => setTargetMatch(e.target.value)} />
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+        {displayMatchId && (
+          <button onClick={() => setTargetMatch(displayMatchId)} type="button"
+            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === displayMatchId ? 'var(--neon-green)' : 'transparent', color: targetMatch === displayMatchId ? '#000' : 'var(--neon-green)', border: '1px solid var(--neon-green)' }}>
+            {displayMatchId} (当前)
+          </button>
+        )}
+        {nextMatch?.displayMatchId && (
+          <button onClick={() => setTargetMatch(nextMatch.displayMatchId)} type="button"
+            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === nextMatch.displayMatchId ? 'var(--neon-blue, #0088ff)' : 'transparent', color: targetMatch === nextMatch.displayMatchId ? '#000' : 'var(--neon-blue, #0088ff)', border: '1px solid var(--neon-blue, #0088ff)' }}>
+            {nextMatch.displayMatchId} (下一场)
+          </button>
+        )}
+      </div>
+      <input placeholder="比赛编号 (如 A5, P3)" value={targetMatch} onChange={e => setTargetMatch(e.target.value)} />
       <input placeholder="机器人名称 (预测谁赢?)" value={botName} onChange={e => setBotName(e.target.value)} style={{ marginTop: '6px' }} />
       <input placeholder="USDC 金额" value={amount} onChange={e => setAmount(e.target.value)} type="number" min="1" step="1" style={{ marginTop: '6px' }} />
       <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
@@ -1118,12 +1132,14 @@ function GameCanvas({
   setMatchId,
   setPlayers,
   setDisplayMatchId,
+  setNextMatch,
   setEpoch,
 }: {
   mode: 'performance' | 'competitive';
   setMatchId: (id: number | null) => void;
   setPlayers: (players: any[]) => void;
   setDisplayMatchId: (id: string | null) => void;
+  setNextMatch: (m: { matchId: number; displayMatchId: string } | null) => void;
   setEpoch: (n: number) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -1138,7 +1154,7 @@ function GameCanvas({
   const [timer, setTimer] = useState('3:00');
   const [timerColor, setTimerColor] = useState('#ff8800');
   const [matchInfo, setMatchInfo] = useState('ARENA: --');
-  const [selectedRoom, setSelectedRoom] = useState(1);
+  const [selectedRoom, setSelectedRoom] = useState('A');
   const [roomCount, setRoomCount] = useState(1);
 
   const isCompetitive = mode === 'competitive';
@@ -1201,6 +1217,7 @@ function GameCanvas({
     const render = (state: any) => {
         setMatchId(state.matchId);
         setDisplayMatchId(state.displayMatchId || null);
+        setNextMatch(state.nextMatch || null);
         if (state.epoch) setEpoch(state.epoch);
 
         // Issue 5: Show "Epoch X #displayMatchId"
@@ -1356,7 +1373,7 @@ function GameCanvas({
     };
 
     return () => { destroyed = true; if (reconnectTimer) clearTimeout(reconnectTimer); if (ws) ws.close(); };
-  }, [setMatchId, setPlayers, selectedRoom, isCompetitive, setDisplayMatchId, setEpoch]);
+  }, [setMatchId, setPlayers, selectedRoom, isCompetitive, setDisplayMatchId, setNextMatch, setEpoch]);
 
   const borderColor = isCompetitive ? 'var(--neon-pink)' : 'var(--neon-blue)';
 
@@ -1367,13 +1384,13 @@ function GameCanvas({
         ) : (
           <h1>🦀 SNAKE AGENTS {selectedRoom}
             <span className="room-selector">
-              {[1,2,3,4,5,6].map(n => (
+              {['A','B','C','D','E','F'].map((letter, i) => (
                 <button
-                  key={n}
-                  className={`room-btn ${selectedRoom === n ? 'active' : ''} ${n > roomCount ? 'disabled' : ''}`}
-                  onClick={() => n <= roomCount && setSelectedRoom(n)}
-                  disabled={n > roomCount}
-                >{n}</button>
+                  key={letter}
+                  className={`room-btn ${selectedRoom === letter ? 'active' : ''} ${i >= roomCount ? 'disabled' : ''}`}
+                  onClick={() => i < roomCount && setSelectedRoom(letter)}
+                  disabled={i >= roomCount}
+                >{letter}</button>
               ))}
             </span>
           </h1>
@@ -2353,6 +2370,7 @@ const controlBtnStyle: React.CSSProperties = {
 function App() {
   const [, setMatchId] = useState<number | null>(null);
   const [displayMatchId, setDisplayMatchId] = useState<string | null>(null);
+  const [nextMatch, setNextMatch] = useState<{ matchId: number; displayMatchId: string } | null>(null);
   const [epoch, setEpoch] = useState(1);
   const [players, setPlayers] = useState<any[]>([]);
   const [perfLeaderboard, setPerfLeaderboard] = useState<any[]>([]);
@@ -2410,6 +2428,7 @@ function App() {
     setPlayers([]);
     setMatchId(null);
     setDisplayMatchId(null);
+    setNextMatch(null);
     setActivePage(page);
   };
 
@@ -2486,7 +2505,7 @@ function App() {
                   )}
                   <div className="panel-section">
                     <h3>🔮 Prediction</h3>
-                    <Prediction displayMatchId={displayMatchId} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} />
+                    <Prediction displayMatchId={displayMatchId} nextMatch={nextMatch} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} />
                   </div>
                 </aside>
 
@@ -2496,6 +2515,7 @@ function App() {
                   setMatchId={throttledSetMatchId}
                   setPlayers={throttledSetPlayers}
                   setDisplayMatchId={setDisplayMatchId}
+                  setNextMatch={setNextMatch}
                   setEpoch={setEpoch}
                 />
 
