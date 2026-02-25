@@ -138,7 +138,7 @@ function WalletButton() {
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          gas: 200_000n,
+          // gas auto-estimated by wallet
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${claimable.length}...`);
@@ -594,7 +594,7 @@ function BotManagement() {
           abi: SNAKE_BOT_NFT_ABI,
           functionName: 'approve',
           args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
-          gas: 100_000n,
+          // gas auto-estimated by wallet
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
         // Wait for on-chain state to propagate and wallet nonce to update
@@ -917,27 +917,34 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
         return;
       }
 
-      // Step 1: Check match exists on-chain
+      // Step 1: Check match exists on-chain (retry up to 30s for next-match that may still be creating)
       setStatus('验证链上比赛...');
-      try {
-        const matchData = await publicClient.readContract({
-          address: CONTRACTS.pariMutuel as `0x${string}`,
-          abi: PARI_MUTUEL_ABI,
-          functionName: 'matches',
-          args: [BigInt(mid)],
-        }) as any;
-        if (!matchData || matchData[0] === 0n) {
-          setStatus('⏳ 该比赛正在链上创建中，请稍等几秒后重试');
-          setBusy(false);
-          return;
+      let matchReady = false;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          const matchData = await publicClient.readContract({
+            address: CONTRACTS.pariMutuel as `0x${string}`,
+            abi: PARI_MUTUEL_ABI,
+            functionName: 'matches',
+            args: [BigInt(mid)],
+          }) as any;
+          if (matchData && matchData[0] !== 0n) {
+            if (matchData[4]) { // settled
+              setStatus('❌ 该比赛已结算');
+              setBusy(false);
+              return;
+            }
+            matchReady = true;
+            break;
+          }
+        } catch { /* RPC error, retry */ }
+        if (attempt < 5) {
+          setStatus(`⏳ 等待链上比赛创建... (${attempt + 1}/6)`);
+          await new Promise(r => setTimeout(r, 5000));
         }
-        if (matchData[4]) { // settled
-          setStatus('❌ 该比赛已结算');
-          setBusy(false);
-          return;
-        }
-      } catch {
-        setStatus('❌ 无法查询链上比赛状态，请稍后重试');
+      }
+      if (!matchReady) {
+        setStatus('⏳ 该比赛尚未在链上创建，请稍等后重试');
         setBusy(false);
         return;
       }
@@ -959,7 +966,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
           abi: ERC20_ABI,
           functionName: 'approve',
           args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
-          gas: 100_000n,
+          // gas auto-estimated by wallet
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
       }
@@ -971,7 +978,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
         args: [BigInt(mid), botIdBytes32, usdcAmount],
-        gas: 300_000n,
+        // gas auto-estimated by wallet
       });
 
       setStatus('链上确认中...');
@@ -1085,7 +1092,7 @@ function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null })
       const txHash = await sendTransactionAsync({
         to: '0xe4b92D0B4D9Ae8EA89934D1C2E39aCbb86824DAF' as `0x${string}`,
         value: parseEther('0.001'),
-        gas: 21_000n,
+        // gas auto-estimated by wallet
       });
 
       setStatus('Confirming on-chain...');
@@ -1677,7 +1684,7 @@ function PortfolioPage() {
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          gas: 200_000n,
+          // gas auto-estimated by wallet
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${data.claimable.length}...`);
@@ -1906,7 +1913,7 @@ function MarketplacePage() {
         functionName: 'buy',
         args: [BigInt(tokenId)],
         value: BigInt(priceWei),
-        gas: 300_000n,
+        // gas auto-estimated by wallet
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
