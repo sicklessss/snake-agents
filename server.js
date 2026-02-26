@@ -658,6 +658,11 @@ function enqueueTx(label, fn) {
     _txQueue.push({ label, fn, resolve: null, reject: null });
     if (!_txRunning) _drainTxQueue();
 }
+// Priority version — inserts at front of queue (used for createMatch so users can bet sooner)
+function enqueueTxPriority(label, fn) {
+    _txQueue.unshift({ label, fn, resolve: null, reject: null });
+    if (!_txRunning) _drainTxQueue();
+}
 // Awaitable version — returns a Promise that resolves/rejects with the tx result
 function enqueueTxAsync(label, fn) {
     return new Promise((resolve, reject) => {
@@ -1270,7 +1275,17 @@ class GameRoom {
             }
         });
 
-        while (this.food.length < MAX_FOOD) {
+        // Competitive: food cap decreases every 30s (5→4→3→2→1→0)
+        const foodCap = this.type === 'competitive'
+            ? Math.max(0, Math.ceil(this.matchTimeLeft / 30) - 1)
+            : MAX_FOOD;
+
+        // Remove excess food if cap decreased
+        while (this.food.length > foodCap) {
+            this.food.pop();
+        }
+
+        while (this.food.length < foodCap) {
             let tries = 0;
             let fx, fy;
             do {
@@ -1289,6 +1304,14 @@ class GameRoom {
 
         Object.values(this.players).forEach((p) => {
             if (!p.alive) return;
+
+            // HP drain: 1 HP per tick → 100 ticks = 12.5 seconds without food = death
+            p.hp -= 1;
+            if (p.hp <= 0) {
+                this.killPlayer(p, 'starvation');
+                return;
+            }
+
             p.direction = p.nextDirection;
             const head = p.body[0];
             const newHead = { x: head.x + p.direction.x, y: head.y + p.direction.y };
@@ -1307,6 +1330,7 @@ class GameRoom {
             if (foodIndex !== -1) {
                 this.food.splice(foodIndex, 1);
                 p.score++;
+                p.hp = 100; // Eating food restores HP to full
             } else {
                 p.body.pop();
             }
@@ -1611,24 +1635,29 @@ class GameRoom {
         if (pariMutuelContract && placements.length > 0) {
             const onChainMatchId = this.currentMatchId;
             const winnerBytes32Array = placements.map(botId => ethers.encodeBytes32String(botId));
-            enqueueTx(`settleMatch ${onChainMatchId}`, async (overrides) => {
-                // Wait for startTime to pass (avoid "Match not started" if createMatch was slow)
-                try {
-                    const matchData = await pariMutuelContract.matches(onChainMatchId);
-                    const startTime = Number(matchData.startTime || 0);
-                    const now = Math.floor(Date.now() / 1000);
-                    if (startTime > now) {
-                        const waitSec = startTime - now + 2;
-                        log.info(`[Blockchain] settleMatch #${onChainMatchId}: waiting ${waitSec}s for startTime`);
-                        await new Promise(r => setTimeout(r, waitSec * 1000));
-                    }
-                } catch (e) { /* match may not exist yet, settle will fail and retry */ }
-                const tx = await pariMutuelContract.settleMatch(onChainMatchId, winnerBytes32Array, overrides);
-                await tx.wait();
-                log.important(`[Blockchain] settleMatch #${onChainMatchId} settled with ${placements.length} winner(s): ${placements.join(', ')}`);
-                settledOnChainMatchIds.push(onChainMatchId);
-                if (settledOnChainMatchIds.length > 200) settledOnChainMatchIds.shift();
-            });
+            // Defer settle until startTime has passed (don't block the tx queue with sleep)
+            const _doSettle = () => {
+                enqueueTx(`settleMatch ${onChainMatchId}`, async (overrides) => {
+                    // Check if startTime has passed; if not, defer instead of sleeping in queue
+                    try {
+                        const matchData = await pariMutuelContract.matches(onChainMatchId);
+                        const startTime = Number(matchData.startTime || 0);
+                        const now = Math.floor(Date.now() / 1000);
+                        if (startTime > now) {
+                            const waitSec = startTime - now + 2;
+                            log.info(`[Blockchain] settleMatch #${onChainMatchId}: deferring ${waitSec}s for startTime`);
+                            setTimeout(_doSettle, waitSec * 1000);
+                            return; // Don't block queue — re-enqueue later
+                        }
+                    } catch (e) { /* match may not exist yet, settle will fail and retry */ }
+                    const tx = await pariMutuelContract.settleMatch(onChainMatchId, winnerBytes32Array, overrides);
+                    await tx.wait();
+                    log.important(`[Blockchain] settleMatch #${onChainMatchId} settled with ${placements.length} winner(s): ${placements.join(', ')}`);
+                    settledOnChainMatchIds.push(onChainMatchId);
+                    if (settledOnChainMatchIds.length > 200) settledOnChainMatchIds.shift();
+                });
+            };
+            _doSettle();
         }
 
         // --- Score: match participation & placements ---
@@ -1767,7 +1796,7 @@ class GameRoom {
             // Create match on-chain
             if (pariMutuelContract) {
                 const onChainMatchId = this.currentMatchId;
-                enqueueTx(`createMatch ${onChainMatchId}`, async (overrides) => {
+                enqueueTxPriority(`createMatch ${onChainMatchId}`, async (overrides) => {
                     const startTime = Math.floor(Date.now() / 1000) + 5;
                     const tx = await pariMutuelContract.createMatch(onChainMatchId, startTime, overrides);
                     await tx.wait();
@@ -1850,6 +1879,7 @@ class GameRoom {
                 nextDirection: spawn.dir,
                 alive: true,
                 score: 0,
+                hp: 100,
                 ws: w.ws,
                 botType: w.botType,
                 botId: w.botId || id,
@@ -1871,17 +1901,19 @@ class GameRoom {
         const nextMid = nextMatchId();
         const nextDispId = getNextDisplayId(this.type, this.letter);
         registerDisplayId(nextDispId, nextMid);
-        this.nextMatch = { matchId: nextMid, displayMatchId: nextDispId };
+        this.nextMatch = { matchId: nextMid, displayMatchId: nextDispId, chainCreated: false };
         log.important(`[Room ${this.id}] Pre-created next match #${nextMid} (${nextDispId})`);
 
         if (pariMutuelContract) {
             const mid = nextMid;
+            const entry = this.nextMatch;
             // Calculate startTime NOW (not in the callback) to avoid queue delay skewing it
             // Next match starts after: current matchTimeLeft + GAMEOVER(5s) + COUNTDOWN(5s) ≈ +10s buffer
             const startTime = Math.floor(Date.now() / 1000) + this.matchTimeLeft + 10;
-            enqueueTx(`createMatch ${mid} (next)`, async (overrides) => {
+            enqueueTxPriority(`createMatch ${mid} (next)`, async (overrides) => {
                 const tx = await pariMutuelContract.createMatch(mid, startTime, overrides);
                 await tx.wait();
+                entry.chainCreated = true;
                 log.important(`[Blockchain] createMatch #${mid} (next, startTime=${startTime}) confirmed`);
             });
         }
@@ -1896,6 +1928,7 @@ class GameRoom {
             head: p.body && p.body.length > 0 ? p.body[0] : null,
             direction: p.direction,
             score: p.score,
+            hp: p.hp,
             alive: p.alive,
             blinking: !p.alive && p.deathTimer > 0,
             deathTimer: p.deathTimer,
@@ -1937,6 +1970,7 @@ class GameRoom {
             nextMatch: this.nextMatch ? {
                 matchId: this.nextMatch.matchId,
                 displayMatchId: this.nextMatch.displayMatchId,
+                chainCreated: this.nextMatch.chainCreated || false,
             } : null,
             epoch: getCurrentEpoch(),
             victoryPause: this.victoryPauseTimer > 0,
@@ -1954,6 +1988,7 @@ class GameRoom {
                     color: p.color,
                     body: p.body.map(s => ({ x: s.x, y: s.y })),
                     score: p.score,
+                    hp: p.hp,
                     alive: p.alive,
                     botType: p.botType,
                 })),

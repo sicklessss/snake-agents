@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useAccount, useWriteContract, useWaitForTransactionReceipt, useConnect, useDisconnect, useSignMessage, useSendTransaction, createConfig, http as wagmiHttp } from 'wagmi';
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useConnect, useDisconnect, useSignMessage, useSendTransaction, useSwitchChain, createConfig, http as wagmiHttp } from 'wagmi';
 import { injected, metaMask, coinbaseWallet } from 'wagmi/connectors';
 import { parseEther, parseUnits, stringToHex, padHex, createPublicClient, http } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -78,6 +78,34 @@ function nameToBytes32(name: string): `0x${string}` {
   return stringToHex(name, { size: 32 });
 }
 
+// Helper: estimate gas via our own RPC (fixes OKX wallet grayed-out confirm button)
+// OKX wallet can't estimate gas on Base Sepolia internally, so we pre-estimate
+// and pass the gas value explicitly. This makes the confirm button clickable.
+async function estimateGas(params: {
+  address: `0x${string}`;
+  abi: any;
+  functionName: string;
+  args: any[];
+  value?: bigint;
+  account: `0x${string}`;
+}): Promise<bigint | undefined> {
+  try {
+    const gas = await publicClient.estimateContractGas({
+      address: params.address,
+      abi: params.abi,
+      functionName: params.functionName,
+      args: params.args,
+      value: params.value,
+      account: params.account,
+    });
+    // Add 30% buffer for safety
+    return gas + (gas * 3n / 10n);
+  } catch (e) {
+    console.warn('[estimateGas] Failed, wallet will estimate:', e);
+    return undefined;
+  }
+}
+
 // --- COMPONENTS ---
 
 // Wallet icons (inline SVG data URIs)
@@ -102,10 +130,11 @@ function getWalletDisplayName(connector: { id: string; name: string }) {
 
 // Wallet connection button + modal selector
 function WalletButton() {
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, chain } = useAccount();
   const { connect, connectors } = useConnect();
   const { disconnect } = useDisconnect();
   const { writeContractAsync } = useWriteContract();
+  const { switchChainAsync } = useSwitchChain();
   const [showModal, setShowModal] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [claimable, setClaimable] = useState<{ matchId: number; winnings: string; winningsWei: string }[]>([]);
@@ -128,17 +157,28 @@ function WalletButton() {
 
   const handleClaim = async () => {
     if (!claimable.length || claiming) return;
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setClaimStatus('Please switch to Base Sepolia'); return; }
+    }
     setClaiming(true);
     setClaimStatus('Claiming...');
     let claimed = 0;
     for (const item of claimable) {
       try {
+        const claimGas = await estimateGas({
+          address: CONTRACTS.pariMutuel as `0x${string}`,
+          abi: PARI_MUTUEL_ABI,
+          functionName: 'claimWinnings',
+          args: [BigInt(item.matchId)],
+          account: address as `0x${string}`,
+        });
         await writeContractAsync({
           address: CONTRACTS.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          // gas auto-estimated by wallet
+          chainId: baseSepolia.id,
+          ...(claimGas ? { gas: claimGas } : {}),
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${claimable.length}...`);
@@ -339,9 +379,10 @@ function WalletButton() {
 
 // Issue 1: Bot Management with 5 slots, scrollable
 function BotManagement() {
-  const { isConnected, address } = useAccount();
+  const { isConnected, address, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
   const { signMessageAsync } = useSignMessage();
+  const { switchChainAsync } = useSwitchChain();
   const [bots, setBots] = useState<any[]>([]);
   const [newName, setNewName] = useState('');
   const [regStatus, setRegStatus] = useState('');
@@ -505,9 +546,31 @@ function BotManagement() {
       setRegStatus('Waiting for on-chain confirmation...');
       await new Promise(r => setTimeout(r, 5000));
 
-      setRegStatus(`Sign on-chain registration (0.01 ETH)... [bot: ${data.id}, wallet: ${address}]`);
+      // Ensure wallet is on Base Sepolia (critical for OKX and other wallets)
+      if (chain?.id !== baseSepolia.id) {
+        setRegStatus('Switching to Base Sepolia...');
+        try {
+          await switchChainAsync({ chainId: baseSepolia.id });
+        } catch (switchErr: any) {
+          setRegStatus('⚠️ Please manually switch your wallet to Base Sepolia (chain 84532)');
+          return;
+        }
+      }
+
+      setRegStatus(`Estimating gas...`);
       const botId32 = nameToBytes32(data.id);
-      console.log('[Register] writeContractAsync params:', { botId: data.id, botId32, address: CONTRACTS.botRegistry, wallet: address });
+      const regArgs = [botId32, '0x0000000000000000000000000000000000000000' as `0x${string}`] as const;
+      const regValue = parseEther('0.01');
+      const gas = await estimateGas({
+        address: CONTRACTS.botRegistry as `0x${string}`,
+        abi: BOT_REGISTRY_ABI,
+        functionName: 'registerBot',
+        args: [...regArgs],
+        value: regValue,
+        account: address as `0x${string}`,
+      });
+      setRegStatus(`Sign on-chain registration (0.01 ETH)...`);
+      console.log('[Register] writeContractAsync params:', { botId: data.id, botId32, address: CONTRACTS.botRegistry, wallet: address, gas: gas?.toString() });
       setRegPending(true);
       setRegError(null);
       try {
@@ -515,8 +578,10 @@ function BotManagement() {
           address: CONTRACTS.botRegistry as `0x${string}`,
           abi: BOT_REGISTRY_ABI,
           functionName: 'registerBot',
-          args: [botId32, '0x0000000000000000000000000000000000000000' as `0x${string}`],
-          value: parseEther('0.01'),
+          args: [...regArgs],
+          value: regValue,
+          chainId: baseSepolia.id,
+          ...(gas ? { gas } : {}),
         });
         setRegHash(hash as `0x${string}`);
       } catch (e: any) {
@@ -549,6 +614,9 @@ function BotManagement() {
     if (!sellBot || !sellPrice) return;
     const priceNum = parseFloat(sellPrice);
     if (isNaN(priceNum) || priceNum <= 0) return alert('Enter a valid price');
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setSellStatus('Please switch to Base Sepolia'); return; }
+    }
     setSellBusy(true);
     setSellStatus('Looking up NFT tokenId...');
     try {
@@ -589,12 +657,20 @@ function BotManagement() {
       }) as string;
       if (currentApproval.toLowerCase() !== (CONTRACTS.botMarketplace as string).toLowerCase()) {
         setSellStatus('1/2 Approving marketplace...');
+        const approveGas = await estimateGas({
+          address: CONTRACTS.snakeBotNFT as `0x${string}`,
+          abi: SNAKE_BOT_NFT_ABI,
+          functionName: 'approve',
+          args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
+          account: address as `0x${string}`,
+        });
         const approveTx = await writeContractAsync({
           address: CONTRACTS.snakeBotNFT as `0x${string}`,
           abi: SNAKE_BOT_NFT_ABI,
           functionName: 'approve',
           args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
-          // gas auto-estimated by wallet
+          chainId: baseSepolia.id,
+          ...(approveGas ? { gas: approveGas } : {}),
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
         // Wait for on-chain state to propagate and wallet nonce to update
@@ -618,11 +694,20 @@ function BotManagement() {
       let listTx: string | undefined;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
+          const listGas = await estimateGas({
+            address: CONTRACTS.botMarketplace as `0x${string}`,
+            abi: BOT_MARKETPLACE_ABI,
+            functionName: 'list',
+            args: [tokenId, priceWei],
+            account: address as `0x${string}`,
+          });
           listTx = await writeContractAsync({
             address: CONTRACTS.botMarketplace as `0x${string}`,
             abi: BOT_MARKETPLACE_ABI,
             functionName: 'list',
             args: [tokenId, priceWei],
+            chainId: baseSepolia.id,
+            ...(listGas ? { gas: listGas } : {}),
           }) as unknown as string;
           break;
         } catch (listErr: any) {
@@ -868,9 +953,10 @@ function BotManagement() {
 }
 
 // Prediction — on-chain USDC betting via SnakeAgentsPariMutuel contract
-function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string } | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
-  const { isConnected, address } = useAccount();
+function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string; chainCreated?: boolean } | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
+  const { isConnected, address, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
+  const { switchChainAsync } = useSwitchChain();
   const [botName, setBotName] = useState('');
   const [targetMatch, setTargetMatch] = useState('');
   const [amount, setAmount] = useState('');
@@ -882,6 +968,9 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
   }, [displayMatchId]);
 
   const handlePredict = async () => {
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    }
     const input = targetMatch.trim().toUpperCase();
     if (!/^[A-FP]\d+$/.test(input)) return alert('请输入比赛编号，如 A5 或 P3');
     let mid: number;
@@ -895,6 +984,10 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
     if (!botName) return alert('请输入机器人名称');
     if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) return alert('请输入 USDC 预测金额');
     if (!isConnected || !address) return alert('请先连接钱包');
+    // Block betting on next match if chain tx hasn't confirmed yet
+    if (input === nextMatch?.displayMatchId && !nextMatch?.chainCreated) {
+      return alert('下一场比赛正在链上创建中，请等按钮显示"下一场"后再投注');
+    }
 
     const botIdBytes32 = nameToBytes32(botName);
     const usdcAmount = parseUnits(amount, 6); // USDC has 6 decimals
@@ -961,24 +1054,40 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
       if (currentAllowance < usdcAmount) {
         setStatus('授权 USDC...');
         const maxApproval = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+        const usdcApproveGas = await estimateGas({
+          address: CONTRACTS.usdc as `0x${string}`,
+          abi: ERC20_ABI,
+          functionName: 'approve',
+          args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
+          account: address as `0x${string}`,
+        });
         const approveTx = await writeContractAsync({
           address: CONTRACTS.usdc as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'approve',
           args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
-          // gas auto-estimated by wallet
+          chainId: baseSepolia.id,
+          ...(usdcApproveGas ? { gas: usdcApproveGas } : {}),
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
       }
 
       // Step 3: Place bet on-chain (USDC, no ETH value)
       setStatus('签名预测交易...');
+      const betGas = await estimateGas({
+        address: CONTRACTS.pariMutuel as `0x${string}`,
+        abi: PARI_MUTUEL_ABI,
+        functionName: 'placeBet',
+        args: [BigInt(mid), botIdBytes32, usdcAmount],
+        account: address as `0x${string}`,
+      });
       const betTx = await writeContractAsync({
         address: CONTRACTS.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
         args: [BigInt(mid), botIdBytes32, usdcAmount],
-        // gas auto-estimated by wallet
+        chainId: baseSepolia.id,
+        ...(betGas ? { gas: betGas } : {}),
       });
 
       setStatus('链上确认中...');
@@ -993,7 +1102,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
         });
       } catch (_) { /* score award is best-effort */ }
 
-      setStatus(`✅ 预测成功！${amount} USDC 预测 ${botName} 赢`);
+      setStatus(`✅ 完成下单！${amount} USDC 预测 ${botName} 赢`);
       setAmount('');
     } catch (e: any) {
       // Extract revert reason from error chain
@@ -1036,9 +1145,9 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
           </button>
         )}
         {nextMatch?.displayMatchId && (
-          <button onClick={() => setTargetMatch(nextMatch.displayMatchId)} type="button"
-            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === nextMatch.displayMatchId ? 'var(--neon-blue, #0088ff)' : 'transparent', color: targetMatch === nextMatch.displayMatchId ? '#000' : 'var(--neon-blue, #0088ff)', border: '1px solid var(--neon-blue, #0088ff)' }}>
-            {nextMatch.displayMatchId} (下一场)
+          <button onClick={() => nextMatch.chainCreated && setTargetMatch(nextMatch.displayMatchId)} type="button"
+            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === nextMatch.displayMatchId ? 'var(--neon-blue, #0088ff)' : 'transparent', color: !nextMatch.chainCreated ? '#666' : targetMatch === nextMatch.displayMatchId ? '#000' : 'var(--neon-blue, #0088ff)', border: `1px solid ${nextMatch.chainCreated ? 'var(--neon-blue, #0088ff)' : '#444'}`, cursor: nextMatch.chainCreated ? 'pointer' : 'not-allowed', opacity: nextMatch.chainCreated ? 1 : 0.6 }}>
+            {nextMatch.displayMatchId} {nextMatch.chainCreated ? '(下一场)' : '(创建中...)'}
           </button>
         )}
       </div>
@@ -1062,17 +1171,21 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
 }
 
 function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null }) {
-  const { isConnected, address } = useAccount();
+  const { isConnected, address, chain } = useAccount();
   const [botName, setBotName] = useState('');
   const [targetMatch, setTargetMatch] = useState('');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
   const { sendTransactionAsync } = useSendTransaction();
+  const { switchChainAsync } = useSwitchChain();
 
   const handleEnter = async () => {
     if (!isConnected || !address) return alert('Connect Wallet');
     if (!botName) return alert('Enter Bot Name');
     if (!targetMatch) return alert('Enter target match (e.g. A3)');
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    }
 
     setBusy(true);
     try {
@@ -1092,7 +1205,8 @@ function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null })
       const txHash = await sendTransactionAsync({
         to: '0xe4b92D0B4D9Ae8EA89934D1C2E39aCbb86824DAF' as `0x${string}`,
         value: parseEther('0.001'),
-        // gas auto-estimated by wallet
+        chainId: baseSepolia.id,
+        gas: 21000n, // Simple ETH transfer is always 21000
       });
 
       setStatus('Confirming on-chain...');
@@ -1378,6 +1492,27 @@ function GameCanvas({
             ctx.closePath();
             ctx.fill();
 
+            // HP bar above snake head
+            if (p.alive && p.hp != null) {
+                const barW = cellSize * 1.2;
+                const barH = Math.max(2, cellSize * 0.15);
+                const barX = head.x * cellSize + cellSize / 2 - barW / 2;
+                const barY = head.y * cellSize - barH - 2;
+                const hpRatio = Math.max(0, Math.min(1, p.hp / 100));
+                // Background (dark)
+                ctx.save();
+                ctx.shadowBlur = 0;
+                ctx.globalAlpha = 0.6;
+                ctx.fillStyle = '#333';
+                ctx.fillRect(barX, barY, barW, barH);
+                // HP fill (green → yellow → red)
+                ctx.globalAlpha = 0.9;
+                ctx.fillStyle = hpRatio > 0.5 ? `rgb(${Math.round((1 - hpRatio) * 2 * 255)},255,0)` : `rgb(255,${Math.round(hpRatio * 2 * 255)},0)`;
+                ctx.fillRect(barX, barY, barW * hpRatio, barH);
+                ctx.restore();
+                ctx.fillStyle = p.color || '#00ff88';
+            }
+
             ctx.shadowBlur = 0;
             ctx.globalAlpha = 1;
         });
@@ -1619,8 +1754,9 @@ function PortfolioButton({ activePage, onSwitch }: { activePage: string; onSwitc
 
 // Full-page Portfolio view — positions, history, claim
 function PortfolioPage() {
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
+  const { switchChainAsync } = useSwitchChain();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<'positions' | 'history' | 'mybots'>('positions');
@@ -1674,17 +1810,28 @@ function PortfolioPage() {
 
   const handleClaimAll = async () => {
     if (!data?.claimable?.length || claiming) return;
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setClaimStatus('Please switch to Base Sepolia'); return; }
+    }
     setClaiming(true);
     setClaimStatus('Claiming...');
     let claimed = 0;
     for (const item of data.claimable) {
       try {
+        const claimGas2 = await estimateGas({
+          address: CONTRACTS.pariMutuel as `0x${string}`,
+          abi: PARI_MUTUEL_ABI,
+          functionName: 'claimWinnings',
+          args: [BigInt(item.matchId)],
+          account: address as `0x${string}`,
+        });
         await writeContractAsync({
           address: CONTRACTS.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          // gas auto-estimated by wallet
+          chainId: baseSepolia.id,
+          ...(claimGas2 ? { gas: claimGas2 } : {}),
         });
         claimed++;
         setClaimStatus(`Claimed ${claimed}/${data.claimable.length}...`);
@@ -1874,8 +2021,9 @@ function PortfolioPage() {
 
 // Full-page Marketplace view — reads from BotMarketplace escrow contract
 function MarketplacePage() {
-  const { isConnected, address } = useAccount();
+  const { isConnected, address, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
+  const { switchChainAsync } = useSwitchChain();
   const [listings, setListings] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [actionId, setActionId] = useState<number | null>(null);
@@ -1901,19 +2049,31 @@ function MarketplacePage() {
 
   const handleBuy = async (item: any) => {
     if (!isConnected || !address) return alert('Please connect wallet first');
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    }
     const tokenId = item.tokenId;
     const priceWei = item.priceWei;
     if (!priceWei || priceWei === '0') return alert('Invalid price');
     setActionId(tokenId);
     setActionStatus('Signing transaction...');
     try {
+      const buyGas = await estimateGas({
+        address: CONTRACTS.botMarketplace as `0x${string}`,
+        abi: BOT_MARKETPLACE_ABI,
+        functionName: 'buy',
+        args: [BigInt(tokenId)],
+        value: BigInt(priceWei),
+        account: address as `0x${string}`,
+      });
       const txHash = await writeContractAsync({
         address: CONTRACTS.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'buy',
         args: [BigInt(tokenId)],
         value: BigInt(priceWei),
-        // gas auto-estimated by wallet
+        chainId: baseSepolia.id,
+        ...(buyGas ? { gas: buyGas } : {}),
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
@@ -1941,14 +2101,26 @@ function MarketplacePage() {
 
   const handleCancel = async (item: any) => {
     if (!isConnected) return alert('Connect wallet first');
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    }
     setActionId(item.tokenId);
     setActionStatus('Cancelling...');
     try {
+      const cancelGas = await estimateGas({
+        address: CONTRACTS.botMarketplace as `0x${string}`,
+        abi: BOT_MARKETPLACE_ABI,
+        functionName: 'cancel',
+        args: [BigInt(item.tokenId)],
+        account: address as `0x${string}`,
+      });
       const txHash = await writeContractAsync({
         address: CONTRACTS.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'cancel',
         args: [BigInt(item.tokenId)],
+        chainId: baseSepolia.id,
+        ...(cancelGas ? { gas: cancelGas } : {}),
       });
       setActionStatus('Confirming...');
       await publicClient.waitForTransactionReceipt({ hash: txHash as `0x${string}` });
@@ -2165,6 +2337,19 @@ function ReplayPage() {
       else if (dir.y === -1) { ctx.moveTo(cx, cy - sz); ctx.lineTo(cx - sz, cy + sz); ctx.lineTo(cx + sz, cy + sz); }
       else { ctx.moveTo(cx, cy + sz); ctx.lineTo(cx - sz, cy - sz); ctx.lineTo(cx + sz, cy - sz); }
       ctx.closePath(); ctx.fill();
+      // HP bar in replay
+      if (p.alive && p.hp != null) {
+        const barW = cellSize * 1.2, barH = Math.max(2, cellSize * 0.15);
+        const barX = head.x * cellSize + cellSize / 2 - barW / 2;
+        const barY = head.y * cellSize - barH - 2;
+        const hpRatio = Math.max(0, Math.min(1, p.hp / 100));
+        ctx.save(); ctx.shadowBlur = 0;
+        ctx.globalAlpha = 0.6; ctx.fillStyle = '#333'; ctx.fillRect(barX, barY, barW, barH);
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = hpRatio > 0.5 ? `rgb(${Math.round((1-hpRatio)*2*255)},255,0)` : `rgb(255,${Math.round(hpRatio*2*255)},0)`;
+        ctx.fillRect(barX, barY, barW * hpRatio, barH);
+        ctx.restore(); ctx.fillStyle = p.color || '#00ff88';
+      }
       ctx.shadowBlur = 0; ctx.globalAlpha = 1;
     });
 
@@ -2355,7 +2540,7 @@ function ReplayPage() {
             {[...players].sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p: any, i: number) => (
               <li key={p.id || i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
                 <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
-                <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
+                <span className="fighter-length">{p.hp != null && p.alive ? `${p.hp}hp ` : ''}{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
               </li>
             ))}
             {players.length === 0 && <li className="fighter-item"><span className="muted">Load a replay</span></li>}
@@ -2380,7 +2565,7 @@ const controlBtnStyle: React.CSSProperties = {
 function App() {
   const [, setMatchId] = useState<number | null>(null);
   const [displayMatchId, setDisplayMatchId] = useState<string | null>(null);
-  const [nextMatch, setNextMatch] = useState<{ matchId: number; displayMatchId: string } | null>(null);
+  const [nextMatch, setNextMatch] = useState<{ matchId: number; displayMatchId: string; chainCreated?: boolean } | null>(null);
   const [epoch, setEpoch] = useState(1);
   const [players, setPlayers] = useState<any[]>([]);
   const [perfLeaderboard, setPerfLeaderboard] = useState<any[]>([]);
@@ -2536,7 +2721,7 @@ function App() {
                       {[...players].filter(p => !p.waiting).sort((a, b) => (b.body?.length || 0) - (a.body?.length || 0)).map((p, i) => (
                         <li key={p.id || i} className={`fighter-item ${p.alive ? 'alive' : 'dead'}`}>
                           <span className="fighter-name" style={{ color: p.color }}>{p.name}</span>
-                          <span className="fighter-length">{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
+                          <span className="fighter-length">{p.hp != null && p.alive ? `${p.hp}hp ` : ''}{p.body?.length || 0} {p.alive ? '🐍' : '💀'}</span>
                         </li>
                       ))}
                     </ul>
