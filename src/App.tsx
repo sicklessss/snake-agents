@@ -2570,6 +2570,10 @@ function App() {
   const [players, setPlayers] = useState<any[]>([]);
   const [perfLeaderboard, setPerfLeaderboard] = useState<any[]>([]);
   const [compLeaderboard, setCompLeaderboard] = useState<any[]>([]);
+  const [perfLeaderboardAll, setPerfLeaderboardAll] = useState<any[]>([]);
+  const [compLeaderboardAll, setCompLeaderboardAll] = useState<any[]>([]);
+  const [lbEpoch, setLbEpoch] = useState(1);
+  const [lbTab, setLbTab] = useState<'epoch' | 'all'>('epoch');
   const [activePage, setActivePage] = useState<'performance' | 'competitive' | 'leaderboard' | 'points' | 'marketplace' | 'portfolio' | 'replay'>('performance');
 
   const playersRef = useRef<any[]>([]);
@@ -2609,6 +2613,9 @@ function App() {
           const data = await res.json();
           setPerfLeaderboard(data.perfLeaderboard || []);
           setCompLeaderboard(data.compLeaderboard || []);
+          setPerfLeaderboardAll(data.perfLeaderboardAll || []);
+          setCompLeaderboardAll(data.compLeaderboardAll || []);
+          if (data.epoch) setLbEpoch(data.epoch);
         }
       } catch (_e) {}
     };
@@ -2646,11 +2653,19 @@ function App() {
 
             {activePage === 'leaderboard' ? (
               <div className="leaderboard-page">
-                <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', justifyContent: 'center', padding: '24px', width: '100%', maxWidth: '900px', margin: '0 auto' }}>
+                <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', padding: '16px 24px 0' }}>
+                  <button onClick={() => setLbTab('epoch')} style={{ padding: '6px 16px', fontSize: '0.85rem', background: lbTab === 'epoch' ? 'var(--neon-green)' : 'transparent', color: lbTab === 'epoch' ? '#000' : 'var(--neon-green)', border: '1px solid var(--neon-green)', cursor: 'pointer' }}>
+                    Epoch {lbEpoch} (Today)
+                  </button>
+                  <button onClick={() => setLbTab('all')} style={{ padding: '6px 16px', fontSize: '0.85rem', background: lbTab === 'all' ? 'var(--neon-blue, #0088ff)' : 'transparent', color: lbTab === 'all' ? '#000' : 'var(--neon-blue, #0088ff)', border: '1px solid var(--neon-blue, #0088ff)', cursor: 'pointer' }}>
+                    All Time
+                  </button>
+                </div>
+                <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', justifyContent: 'center', padding: '16px 24px 24px', width: '100%', maxWidth: '900px', margin: '0 auto' }}>
                   <div className="panel-section" style={{ flex: 1, minWidth: '280px' }}>
-                    <h2 style={{ color: 'var(--neon-green)', textAlign: 'center' }}>🦀 Performance</h2>
+                    <h2 style={{ color: 'var(--neon-green)', textAlign: 'center' }}>Performance</h2>
                     <ul className="fighter-list">
-                      {perfLeaderboard.map((p: any, i: number) => (
+                      {(lbTab === 'epoch' ? perfLeaderboard : perfLeaderboardAll).map((p: any, i: number) => (
                         <li key={p.name || i} className="fighter-item alive">
                           <span className="fighter-name">
                             {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`} {p.name}
@@ -2658,13 +2673,13 @@ function App() {
                           <span className="fighter-length">{p.wins}W</span>
                         </li>
                       ))}
-                      {perfLeaderboard.length === 0 && <li className="fighter-item"><span className="muted">No data yet</span></li>}
+                      {(lbTab === 'epoch' ? perfLeaderboard : perfLeaderboardAll).length === 0 && <li className="fighter-item"><span className="muted">No data yet</span></li>}
                     </ul>
                   </div>
                   <div className="panel-section" style={{ flex: 1, minWidth: '280px' }}>
-                    <h2 style={{ color: 'var(--neon-pink)', textAlign: 'center' }}>⚔️ Competitive</h2>
+                    <h2 style={{ color: 'var(--neon-pink)', textAlign: 'center' }}>Competitive</h2>
                     <ul className="fighter-list">
-                      {compLeaderboard.map((p: any, i: number) => (
+                      {(lbTab === 'epoch' ? compLeaderboard : compLeaderboardAll).map((p: any, i: number) => (
                         <li key={p.name || i} className="fighter-item alive">
                           <span className="fighter-name">
                             {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${i+1}`} {p.name}
@@ -2672,7 +2687,7 @@ function App() {
                           <span className="fighter-length">{p.wins}W</span>
                         </li>
                       ))}
-                      {compLeaderboard.length === 0 && <li className="fighter-item"><span className="muted">No data yet</span></li>}
+                      {(lbTab === 'epoch' ? compLeaderboard : compLeaderboardAll).length === 0 && <li className="fighter-item"><span className="muted">No data yet</span></li>}
                     </ul>
                   </div>
                 </div>

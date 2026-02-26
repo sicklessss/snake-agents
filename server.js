@@ -563,6 +563,14 @@ app.use((req, res, next) => {
 // API rate limiting
 app.use('/api', rateLimit({ windowMs: 60_000, max: 120 }));
 
+// Epoch counter — days since 2026-02-20 (launch date), starting at 1
+const EPOCH_ORIGIN = new Date('2026-02-20T00:00:00Z');
+function getCurrentEpoch() {
+    const now = new Date();
+    const diffMs = now.getTime() - EPOCH_ORIGIN.getTime();
+    return Math.max(1, Math.floor(diffMs / (24 * 60 * 60 * 1000)) + 1);
+}
+
 // --- Global History ---
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
 let matchHistory = [];
@@ -574,6 +582,58 @@ if (fs.existsSync(HISTORY_FILE)) {
             matchNumber = matchHistory[0].matchId + 1;
         }
     } catch (e) { log.warn('[History] Failed to load:', e.message); }
+}
+
+// --- Aggregated Leaderboard Stats (never loses data) ---
+// Structure: { "perf": { epoch: { name: wins } }, "comp": { epoch: { name: wins } } }
+const LB_STATS_FILE = path.join(DATA_DIR, 'leaderboard-stats.json');
+let lbStats = { perf: {}, comp: {} };
+if (fs.existsSync(LB_STATS_FILE)) {
+    try { lbStats = JSON.parse(fs.readFileSync(LB_STATS_FILE)); } catch (e) { log.warn('[LBStats] Failed to load:', e.message); }
+}
+let _lbStatsDirty = false;
+function recordWin(arenaType, epoch, winnerName) {
+    if (!winnerName || winnerName === 'No Winner') return;
+    const type = arenaType.startsWith('performance') ? 'perf' : arenaType.startsWith('competitive') ? 'comp' : null;
+    if (!type) return;
+    const ep = String(epoch);
+    if (!lbStats[type][ep]) lbStats[type][ep] = {};
+    lbStats[type][ep][winnerName] = (lbStats[type][ep][winnerName] || 0) + 1;
+    _lbStatsDirty = true;
+}
+function saveLbStats() {
+    if (!_lbStatsDirty) return;
+    _lbStatsDirty = false;
+    try { atomicWriteFile(LB_STATS_FILE, JSON.stringify(lbStats)); }
+    catch (e) { log.error('[LBStats] Failed to save:', e.message); }
+}
+// Flush aggregated stats every 30s (batched to avoid excessive disk writes)
+setInterval(saveLbStats, 30_000);
+
+function getLbFromStats(type, epochFilter) {
+    const data = lbStats[type] || {};
+    const counts = {};
+    for (const [ep, names] of Object.entries(data)) {
+        if (epochFilter != null && String(ep) !== String(epochFilter)) continue;
+        for (const [name, wins] of Object.entries(names)) {
+            counts[name] = (counts[name] || 0) + wins;
+        }
+    }
+    return Object.entries(counts).map(([name, wins]) => ({ name, wins })).sort((a, b) => b.wins - a.wins).slice(0, 30);
+}
+
+// On startup: if lbStats file didn't exist, seed from matchHistory
+if (!fs.existsSync(LB_STATS_FILE)) {
+    let count = 0;
+    for (const h of matchHistory) {
+        if (!h.arenaId || !h.winner || (h.winner === 'No Winner' && (h.score || 0) === 0)) continue;
+        const ep = h.epoch || (h.timestamp ? Math.max(1, Math.floor((new Date(h.timestamp).getTime() - EPOCH_ORIGIN.getTime()) / (24*60*60*1000)) + 1) : 0);
+        if (!ep) continue;
+        recordWin(h.arenaId, ep, h.winner);
+        count++;
+    }
+    saveLbStats();
+    log.important(`[LBStats] Seeded from ${count} history records`);
 }
 
 function nextMatchId() {
@@ -610,14 +670,6 @@ function saveCounters() {
         fs.writeFileSync(tmp, JSON.stringify(roomCounters));
         fs.renameSync(tmp, COUNTERS_FILE);
     } catch (e) { log.warn('[Counters] Failed to save:', e.message); }
-}
-
-// Epoch counter — days since 2026-02-20 (launch date), starting at 1
-const EPOCH_ORIGIN = new Date('2026-02-20T00:00:00Z');
-function getCurrentEpoch() {
-    const now = new Date();
-    const diffMs = now.getTime() - EPOCH_ORIGIN.getTime();
-    return Math.max(1, Math.floor(diffMs / (24 * 60 * 60 * 1000)) + 1);
 }
 
 // Map displayMatchId → numeric matchId (for pool lookup)
@@ -733,19 +785,23 @@ function checkDailyReset() {
 setInterval(checkDailyReset, 60_000);
 
 function saveHistory(arenaId, winnerName, score, winnerId, participants) {
+    const ep = getCurrentEpoch();
     matchHistory.unshift({
         matchId: nextMatchId(),
         arenaId,
+        epoch: ep,
         timestamp: new Date().toISOString(),
         winner: winnerName,
         winnerId: winnerId || null,
         score: score,
         participants: participants || [],
     });
-    // Keep last 500 matches
-    if (matchHistory.length > 500) matchHistory = matchHistory.slice(0, 500);
+    // Keep last 5000 recent matches (raw data for replays/debugging; leaderboard uses lbStats)
+    if (matchHistory.length > 5000) matchHistory = matchHistory.slice(0, 5000);
     try { atomicWriteFile(HISTORY_FILE, JSON.stringify(matchHistory)); }
     catch (e) { log.error('[History] Failed to save:', e.message); }
+    // Record win in aggregated stats (permanent, never truncated)
+    recordWin(arenaId, ep, winnerName);
 }
 
 // --- Game Config ---
@@ -3170,46 +3226,35 @@ app.post('/api/admin/create-on-chain', requireAdminKey, async (req, res) => {
 });
 // Batch endpoint: returns all data needed for initial page load in one request
 app.get('/api/init', (req, res) => {
-    const perfCounts = {};
-    const compCounts = {};
-    matchHistory.forEach(h => {
-        if (!h.arenaId) return;
-        if (h.winner === 'No Winner' && h.score === 0) return;
-        const key = h.winner || 'No Winner';
-        if (h.arenaId.startsWith('performance')) perfCounts[key] = (perfCounts[key] || 0) + 1;
-        if (h.arenaId.startsWith('competitive')) compCounts[key] = (compCounts[key] || 0) + 1;
-    });
+    const curEpoch = getCurrentEpoch();
     res.json({
-        perfLeaderboard: Object.entries(perfCounts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30),
-        compLeaderboard: Object.entries(compCounts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30),
+        epoch: curEpoch,
+        perfLeaderboard: getLbFromStats('perf', curEpoch),
+        compLeaderboard: getLbFromStats('comp', curEpoch),
+        perfLeaderboardAll: getLbFromStats('perf', null),
+        compLeaderboardAll: getLbFromStats('comp', null),
     });
 });
 
 app.get('/api/leaderboard/global', (req, res) => {
-    res.json(leaderboardFromHistory());
+    // Merge perf + comp all-time
+    const counts = {};
+    for (const type of ['perf', 'comp']) {
+        for (const names of Object.values(lbStats[type] || {})) {
+            for (const [name, wins] of Object.entries(names)) {
+                counts[name] = (counts[name] || 0) + wins;
+            }
+        }
+    }
+    res.json(Object.entries(counts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30));
 });
 
 app.get('/api/leaderboard/performance', (req, res) => {
-    // Filter for all performance arenas
-    const counts = {};
-    matchHistory.forEach(h => {
-        if (!h.arenaId || !h.arenaId.startsWith('performance')) return;
-        if (h.winner === 'No Winner' && h.score === 0) return;
-        const key = h.winner || 'No Winner';
-        counts[key] = (counts[key] || 0) + 1;
-    });
-    res.json(Object.entries(counts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30));
+    res.json(getLbFromStats('perf', null));
 });
 
 app.get('/api/leaderboard/competitive', (req, res) => {
-    const counts = {};
-    matchHistory.forEach(h => {
-        if (!h.arenaId || !h.arenaId.startsWith('competitive')) return;
-        if (h.winner === 'No Winner' && h.score === 0) return;
-        const key = h.winner || 'No Winner';
-        counts[key] = (counts[key] || 0) + 1;
-    });
-    res.json(Object.entries(counts).map(([name, wins]) => ({ name, wins })).sort((a,b)=>b.wins-a.wins).slice(0, 30));
+    res.json(getLbFromStats('comp', null));
 });
 
 app.get('/api/leaderboard/arena/:arenaId', (req, res) => {
