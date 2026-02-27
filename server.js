@@ -527,12 +527,40 @@ function rateLimit({ windowMs, max }) {
     };
 }
 
+// Admin auth with brute-force protection (exponential backoff per IP)
+const _adminFailures = new Map(); // ip -> { count, lockUntil }
+setInterval(() => { // cleanup every 10 minutes
+    const now = Date.now();
+    for (const [ip, f] of _adminFailures.entries()) {
+        if (now - f.lastAttempt > 3600_000) _adminFailures.delete(ip);
+    }
+}, 600_000);
+
 function requireAdminKey(req, res, next) {
     if (!ADMIN_KEY) return res.status(503).json({ error: 'admin_key_not_configured' });
+
+    const ip = getClientIp(req);
+    const failures = _adminFailures.get(ip) || { count: 0, lockUntil: 0, lastAttempt: 0 };
+
+    // Check lockout
+    if (failures.lockUntil > Date.now()) {
+        const waitSec = Math.ceil((failures.lockUntil - Date.now()) / 1000);
+        return res.status(429).json({ error: 'too_many_attempts', retryAfter: waitSec });
+    }
+
     const key = req.header('x-api-key');
     if (!key || key.length !== ADMIN_KEY.length || !require('crypto').timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_KEY))) {
+        // Record failure with exponential backoff: 2s, 4s, 8s, 16s... max 300s
+        failures.count++;
+        failures.lastAttempt = Date.now();
+        failures.lockUntil = Date.now() + Math.min(300_000, 2000 * Math.pow(2, failures.count - 1));
+        _adminFailures.set(ip, failures);
+        log.warn(`[Admin] Auth failure from ${ip} (attempt ${failures.count})`);
         return res.status(401).json({ error: 'unauthorized' });
     }
+
+    // Success: reset failures
+    _adminFailures.delete(ip);
     next();
 }
 

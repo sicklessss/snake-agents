@@ -158,32 +158,46 @@ const API_BASE = '';
 let adminKey = sessionStorage.getItem('snake_admin_key') || '';
 let refreshTimer = null;
 
-// --- Auth ---
+// --- Auth (with brute-force delay) ---
+let loginAttempts = 0;
+let loginLocked = false;
+
 async function doLogin() {
+  if (loginLocked) return;
   const key = document.getElementById('keyInput').value.trim();
   if (!key) return;
+  const btn = document.querySelector('#loginScreen button');
+  btn.disabled = true;
+  btn.textContent = 'Verifying...';
+
+  adminKey = key;
   try {
     const r = await apiFetch('/api/admin/dashboard-data');
     if (r.ok) {
-      adminKey = key;
+      loginAttempts = 0;
       sessionStorage.setItem('snake_admin_key', key);
       showDashboard();
+      btn.disabled = false;
+      btn.textContent = 'Login';
+      return;
     }
   } catch (e) {
-    // retry with the new key
-    adminKey = key;
-    try {
-      const r = await apiFetch('/api/admin/dashboard-data');
-      if (r.ok) {
-        sessionStorage.setItem('snake_admin_key', key);
-        showDashboard();
-        return;
-      }
-    } catch (e2) {}
-    document.getElementById('loginError').textContent = 'Invalid admin key';
-    document.getElementById('loginError').classList.remove('hidden');
+    const errEl = document.getElementById('loginError');
+    loginAttempts++;
     adminKey = '';
+
+    if (e.message.includes('429')) {
+      errEl.textContent = 'Too many attempts. Please wait before retrying.';
+    } else {
+      const delaySec = Math.min(30, Math.pow(2, loginAttempts));
+      errEl.textContent = `Invalid admin key. Wait ${delaySec}s before retrying.`;
+      loginLocked = true;
+      setTimeout(() => { loginLocked = false; btn.disabled = false; btn.textContent = 'Login'; }, delaySec * 1000);
+    }
+    errEl.classList.remove('hidden');
   }
+  btn.disabled = false;
+  btn.textContent = 'Login';
 }
 
 function doLogout() {
