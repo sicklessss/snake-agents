@@ -1607,15 +1607,11 @@ class GameRoom {
         if (aliveCount <= 5 && !this._bettingLockSent && pariMutuelContract) {
             this._bettingLockSent = true;
             const matchId = this.currentMatchId;
-            (async () => {
-                try {
-                    const overrides = { gasLimit: 100_000 };
-                    const tx = await pariMutuelContract.lockBetting(matchId, overrides);
-                    log.info(`[PariMutuel] lockBetting tx sent for match ${matchId}: ${tx.hash}`);
-                } catch (e) {
-                    log.warn(`[PariMutuel] lockBetting failed for match ${matchId}: ${e.message}`);
-                }
-            })();
+            enqueueTx(`lockBetting ${matchId}`, async (overrides) => {
+                const tx = await pariMutuelContract.lockBetting(matchId, overrides);
+                await tx.wait();
+                log.info(`[PariMutuel] lockBetting #${matchId} confirmed`);
+            });
         }
 
         const totalPlayers = Object.keys(this.players).length;
