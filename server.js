@@ -2792,28 +2792,37 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         }
         log.important('[Register] Bot ' + botMeta.name + ' (' + botId + ') claimed via regCode by ' + (owner || 'unknown'));
 
-        // Create bot on-chain and WAIT for confirmation before responding
+        // Create bot on-chain (priority queue + timeout so HTTP doesn't hang)
         if (botRegistryContract) {
             const botIdBytes32 = ethers.encodeBytes32String(botId);
+            let alreadyOnChain = false;
             try {
                 const existing = await botRegistryContract.getBotById(botIdBytes32);
-                if (existing && existing.botId === botIdBytes32) {
-                    log.important(`[Blockchain] Bot ${botId} already on-chain, skipping createBot`);
-                    return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
-                }
+                if (existing && existing.botId === botIdBytes32) alreadyOnChain = true;
             } catch (_) {}
-            try {
-                await enqueueTxAsync(`createBot ${botId} (regCode)`, async (overrides) => {
-                    const tx = await botRegistryContract.createBot(
-                        botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides
-                    );
+
+            if (alreadyOnChain) {
+                log.important(`[Blockchain] Bot ${botId} already on-chain, skipping createBot`);
+                return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
+            }
+
+            // Fire createBot with priority (front of TX queue) but don't block forever
+            const createPromise = new Promise((resolve, reject) => {
+                _txQueue.unshift({ label: `createBot ${botId} (regCode)`, fn: async (overrides) => {
+                    const tx = await botRegistryContract.createBot(botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides);
                     await tx.wait(1, 60000);
                     log.important(`[Blockchain] Bot ${botId} created on-chain via regCode claim`);
-                });
+                }, resolve, reject });
+                if (!_txRunning) _drainTxQueue();
+            });
+            const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 30000));
+            try {
+                await Promise.race([createPromise, timeout]);
                 return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
             } catch (e) {
-                log.error(`[Register] createBot on-chain failed for ${botId}:`, e.message);
-                return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: false, message: 'Bot claimed but on-chain creation failed: ' + e.message });
+                // Timed out or failed — bot is claimed locally, on-chain creation continues in background
+                log.warn(`[Register] createBot ${botId} didn't confirm in time: ${e.message}`);
+                return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: e.message === 'timeout', message: e.message === 'timeout' ? 'On-chain creation in progress, please wait 30s then retry registration' : e.message });
             }
         }
 
@@ -2868,31 +2877,31 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         saveBotRegistry();
     }
 
-    // Create bot on-chain and WAIT for confirmation
+    // Create bot on-chain (priority + timeout)
     let onChainOk = true;
     if (botRegistryContract) {
         const botIdBytes32 = ethers.encodeBytes32String(id);
+        let alreadyExists = false;
         try {
             const existing = await botRegistryContract.getBotById(botIdBytes32);
-            if (existing && existing.botId === botIdBytes32) {
-                log.important(`[Blockchain] Bot ${id} already exists on-chain, skipping createBot`);
-            }
-        } catch (_) {
-            // Bot not on-chain yet, create it
-            try {
-                await enqueueTxAsync(`createBot ${id}`, async (overrides) => {
-                    const tx = await botRegistryContract.createBot(
-                        botIdBytes32,
-                        safeName,
-                        ethers.ZeroAddress,
-                        overrides
-                    );
+            if (existing && existing.botId === botIdBytes32) alreadyExists = true;
+        } catch (_) {}
+
+        if (!alreadyExists) {
+            const createPromise = new Promise((resolve, reject) => {
+                _txQueue.unshift({ label: `createBot ${id}`, fn: async (overrides) => {
+                    const tx = await botRegistryContract.createBot(botIdBytes32, safeName, ethers.ZeroAddress, overrides);
                     await tx.wait(1, 60000);
                     log.important(`[Blockchain] Bot ${id} created on-chain via /register`);
-                });
+                }, resolve, reject });
+                if (!_txRunning) _drainTxQueue();
+            });
+            const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 30000));
+            try {
+                await Promise.race([createPromise, timeout]);
             } catch (e) {
-                log.error(`[Register] createBot on-chain failed for ${id}:`, e.message);
-                onChainOk = false;
+                log.warn(`[Register] createBot ${id} didn't confirm in time: ${e.message}`);
+                onChainOk = e.message === 'timeout'; // timeout = tx still pending, might succeed
             }
         }
     }

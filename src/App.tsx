@@ -1093,15 +1093,12 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
       setStatus('链上确认中...');
       await publicClient.waitForTransactionReceipt({ hash: betTx as `0x${string}` });
 
-      // Award score for betting (with wallet signature)
+      // Award score for betting (best-effort, no extra signature needed)
       try {
-        const scoreTs = Date.now().toString();
-        const scoreMsg = `SnakeAgents BetScore\nAddress: ${address}\nAmount: ${parseFloat(amount)}\nTimestamp: ${scoreTs}`;
-        const scoreSig = await signMessageAsync({ message: scoreMsg });
         await fetch('/api/score/bet', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName, signature: scoreSig, timestamp: scoreTs }),
+          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName, txHash: betTx }),
         });
       } catch (_) { /* score award is best-effort */ }
 
