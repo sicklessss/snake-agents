@@ -963,10 +963,21 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
   const [amount, setAmount] = useState('');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  const [activeMatches, setActiveMatches] = useState<any[]>([]);
 
   useEffect(() => {
     if (displayMatchId) setTargetMatch(displayMatchId);
   }, [displayMatchId]);
+
+  // Fetch all bettable matches across all rooms
+  useEffect(() => {
+    const fetchMatches = () => {
+      fetch('/api/matches/active').then(r => r.json()).then(setActiveMatches).catch(() => {});
+    };
+    fetchMatches();
+    const timer = setInterval(fetchMatches, 10000);
+    return () => clearInterval(timer);
+  }, []);
 
   const handlePredict = async () => {
     if (chain?.id !== baseSepolia.id) {
@@ -985,10 +996,6 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
     if (!botName) return alert('请输入机器人名称');
     if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) return alert('请输入 USDC 预测金额');
     if (!isConnected || !address) return alert('请先连接钱包');
-    // Block betting on next match if chain tx hasn't confirmed yet
-    if (input === nextMatch?.displayMatchId && !nextMatch?.chainCreated) {
-      return alert('下一场比赛正在链上创建中，请等按钮显示"下一场"后再投注');
-    }
 
     const botIdBytes32 = nameToBytes32(botName);
     const usdcAmount = parseUnits(amount, 6); // USDC has 6 decimals
@@ -1136,20 +1143,18 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
 
   return (
     <div className="panel-card">
-      <div className="panel-row"><span>当前比赛</span><span>{displayMatchId ? `Epoch ${epoch} #${displayMatchId}` : '--'}</span></div>
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
-        {displayMatchId && (
-          <button onClick={() => setTargetMatch(displayMatchId)} type="button"
-            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === displayMatchId ? 'var(--neon-green)' : 'transparent', color: targetMatch === displayMatchId ? '#000' : 'var(--neon-green)', border: '1px solid var(--neon-green)' }}>
-            {displayMatchId} (当前)
-          </button>
-        )}
-        {nextMatch?.displayMatchId && (
-          <button onClick={() => nextMatch.chainCreated && setTargetMatch(nextMatch.displayMatchId)} type="button"
-            style={{ flex: 1, fontSize: '0.75rem', padding: '4px 6px', background: targetMatch === nextMatch.displayMatchId ? 'var(--neon-blue, #0088ff)' : 'transparent', color: !nextMatch.chainCreated ? '#666' : targetMatch === nextMatch.displayMatchId ? '#000' : 'var(--neon-blue, #0088ff)', border: `1px solid ${nextMatch.chainCreated ? 'var(--neon-blue, #0088ff)' : '#444'}`, cursor: nextMatch.chainCreated ? 'pointer' : 'not-allowed', opacity: nextMatch.chainCreated ? 1 : 0.6 }}>
-            {nextMatch.displayMatchId} {nextMatch.chainCreated ? '(下一场)' : '(创建中...)'}
-          </button>
-        )}
+      <div className="panel-row"><span>选择比赛</span><span>Epoch {epoch}</span></div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', marginBottom: '6px' }}>
+        {activeMatches.filter(m => m.gameState === 'PLAYING').map(m => {
+          const isCurrent = m.displayMatchId === displayMatchId;
+          const selected = targetMatch === m.displayMatchId;
+          return (
+            <button key={m.displayMatchId} onClick={() => setTargetMatch(m.displayMatchId)} type="button"
+              style={{ fontSize: '0.7rem', padding: '3px 6px', background: selected ? 'var(--neon-green)' : 'transparent', color: selected ? '#000' : isCurrent ? 'var(--neon-green)' : '#aaa', border: `1px solid ${isCurrent ? 'var(--neon-green)' : m.bettingOpen ? '#555' : '#333'}`, opacity: m.bettingOpen ? 1 : 0.5 }}>
+              {m.displayMatchId}{isCurrent ? '★' : ''}{!m.bettingOpen ? '🔒' : ''}
+            </button>
+          );
+        })}
       </div>
       <input placeholder="比赛编号 (如 A5, P3)" value={targetMatch} onChange={e => setTargetMatch(e.target.value)} />
       <input placeholder="机器人名称 (预测谁赢?)" value={botName} onChange={e => setBotName(e.target.value)} style={{ marginTop: '6px' }} />

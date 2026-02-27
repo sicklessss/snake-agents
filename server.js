@@ -3182,6 +3182,38 @@ app.get('/api/match/by-display-id', (req, res) => {
     res.json({ displayMatchId: id.toUpperCase(), matchId });
 });
 
+// All currently bettable matches across all rooms
+app.get('/api/matches/active', (req, res) => {
+    const matches = [];
+    for (const [, room] of rooms) {
+        const aliveCount = Object.values(room.players).filter(p => p.alive).length;
+        matches.push({
+            displayMatchId: room.displayMatchId,
+            matchId: room.currentMatchId,
+            arenaId: room.id,
+            type: room.type,
+            gameState: room.gameState,
+            timeLeft: room.matchTimeLeft,
+            players: Object.keys(room.players).length,
+            bettingOpen: room.gameState === 'PLAYING' && aliveCount > 5,
+        });
+        if (room.nextMatch) {
+            matches.push({
+                displayMatchId: room.nextMatch.displayMatchId,
+                matchId: room.nextMatch.matchId,
+                arenaId: room.id,
+                type: room.type,
+                gameState: 'NEXT',
+                timeLeft: null,
+                players: 0,
+                bettingOpen: room.nextMatch.chainCreated || false,
+                chainCreated: room.nextMatch.chainCreated || false,
+            });
+        }
+    }
+    res.json(matches);
+});
+
 // --- Competitive Arena API ---
 app.get('/api/competitive/status', (req, res) => {
     const room = rooms.get('competitive-1');
