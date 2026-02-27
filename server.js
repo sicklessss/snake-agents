@@ -1,5 +1,15 @@
 require('dotenv').config();
 
+// --- Global error handlers (must be early to catch startup errors) ---
+process.on('uncaughtException', (err) => {
+    console.error('[FATAL] Uncaught exception:', err);
+    // Give 3 seconds for pending I/O (log writes, file saves) then exit
+    setTimeout(() => process.exit(1), 3000);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] Unhandled promise rejection:', reason);
+});
+
 const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
@@ -52,7 +62,7 @@ const { ethers } = require('ethers');
 const CONTRACTS = {
     botRegistry: process.env.BOT_REGISTRY_CONTRACT || '0x98B230509E2e825Ff94Ce69aA21662101E564FA2',
     rewardDistributor: process.env.REWARD_DISTRIBUTOR_CONTRACT || '0x6c8d215606E23BBd353ABC5f531fbB0EaEeDe037',
-    pariMutuel: process.env.PARIMUTUEL_CONTRACT || '0x4bcf26A28919bBD30833a022244a3d2819317649',
+    pariMutuel: process.env.PARIMUTUEL_CONTRACT || '0x4428D307E979C4F618E6BFf3a381b20F6F5d228f',
     snakeBotNFT: process.env.NFT_CONTRACT || '0x7aC014594957c47cD822ddEA6910655C1987B84C',
     referralRewards: process.env.REFERRAL_CONTRACT || '0xA89FBd57Dd34d89F7D54a1980e6875fee5F2B819',
     botMarketplace: process.env.BOT_MARKETPLACE_CONTRACT || '0x690c4c95317cE4C3e4848440c4ADC751781138f8'
@@ -98,8 +108,25 @@ const SNAKE_BOT_NFT_ABI = [
 
 // Edit token store: token -> { botId, address, expires }
 const editTokens = new Map();
-// Used tx hashes for competitive entry (prevent replay)
-const usedEntryTxHashes = new Set();
+// Used tx hashes for competitive entry (prevent replay) — persisted to disk
+const USED_TX_HASHES_FILE = path.join(DATA_DIR, 'used-entry-tx-hashes.json');
+let usedEntryTxHashes = new Set();
+try {
+    if (fs.existsSync(USED_TX_HASHES_FILE)) {
+        const arr = JSON.parse(fs.readFileSync(USED_TX_HASHES_FILE, 'utf8'));
+        usedEntryTxHashes = new Set(arr);
+        log.info(`[TxHashes] Loaded ${usedEntryTxHashes.size} used entry tx hashes`);
+    }
+} catch (e) { log.warn('[TxHashes] Failed to load:', e.message); }
+function saveUsedTxHashes() {
+    try {
+        // Keep only the most recent 5000 hashes to prevent unbounded growth
+        const arr = [...usedEntryTxHashes];
+        const trimmed = arr.length > 5000 ? arr.slice(arr.length - 5000) : arr;
+        if (trimmed.length < arr.length) usedEntryTxHashes = new Set(trimmed);
+        atomicWriteFile(USED_TX_HASHES_FILE, JSON.stringify(trimmed));
+    } catch (e) { log.error('[TxHashes] Failed to save:', e.message); }
+}
 // Track on-chain settled match IDs for claim lookup (bounded ring buffer)
 const settledOnChainMatchIds = [];
 
@@ -155,17 +182,22 @@ const PARI_MUTUEL_ABI = [
     "function createMatch(uint256 _matchId, uint256 _startTime) external",
     "function settleMatch(uint256 _matchId, bytes32[] calldata _winners) external",
     "function cancelMatch(uint256 _matchId, string calldata _reason) external",
+    "function lockBetting(uint256 _matchId) external",
     "function placeBet(uint256 _matchId, bytes32 _botId, uint256 _amount) external",
     "function claimWinnings(uint256 _matchId) external",
     "function claimRefund(uint256 _matchId) external",
+    "function emergencyRefundMatch(uint256 _matchId) external",
     "function authorizeOracle(address _oracle) external",
-    "function matches(uint256) external view returns (uint256 matchId, uint256 startTime, uint256 endTime, uint256 totalPool, bool settled, bool cancelled)",
+    "function matches(uint256) external view returns (uint256 matchId, uint256 startTime, uint256 endTime, uint256 totalPool, uint256 uniqueBettors, bool settled, bool cancelled, bool bettingLocked)",
     "function getUserPotentialWinnings(uint256 _matchId, address _bettor) external view returns (uint256)",
     "function getMatchBets(uint256 _matchId) external view returns (tuple(address bettor, bytes32 botId, uint256 amount, bool claimed)[])",
     "function botTotalBets(uint256, bytes32) external view returns (uint256)",
     "function getCurrentOdds(uint256 _matchId, bytes32 _botId) external view returns (uint256)",
+    "function accumulatedPlatformFees() external view returns (uint256)",
+    "function withdrawPlatformFees() external",
     "event BetPlaced(uint256 indexed matchId, address indexed bettor, bytes32 indexed botId, uint256 amount, uint256 betIndex)",
-    "event MatchSettled(uint256 indexed matchId, bytes32[] winners, uint256 totalPool, uint256 platformRake, uint256 botRewards)"
+    "event MatchSettled(uint256 indexed matchId, bytes32[] winners, uint256 totalPool, uint256 platformRake, uint256 botRewards)",
+    "event BettingLocked(uint256 indexed matchId)"
 ];
 
 const BOT_MARKETPLACE_ABI = [
@@ -175,9 +207,17 @@ const BOT_MARKETPLACE_ABI = [
     "function getActiveListings() external view returns (uint256[] memory tokenIds, address[] memory sellers, uint256[] memory prices)",
     "function listings(uint256) external view returns (address seller, uint256 price)",
     "function feePercent() external view returns (uint256)",
+    "function accumulatedFees() external view returns (uint256)",
+    "function withdrawFees() external",
     "event Listed(uint256 indexed tokenId, address indexed seller, uint256 price)",
     "event Sold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price)",
     "event Cancelled(uint256 indexed tokenId, address indexed seller)"
+];
+
+const ERC20_ABI = [
+    "function balanceOf(address) external view returns (uint256)",
+    "function decimals() external view returns (uint8)",
+    "function symbol() external view returns (string)"
 ];
 
 // Initialize contracts
@@ -196,7 +236,7 @@ function initContracts() {
         referralRewardsContract = new ethers.Contract(CONTRACTS.referralRewards, REFERRAL_REWARDS_ABI, provider);
         pariMutuelContract = new ethers.Contract(CONTRACTS.pariMutuel, PARI_MUTUEL_ABI, backendWallet);
         if (CONTRACTS.botMarketplace !== '0x0000000000000000000000000000000000000000') {
-            botMarketplaceContract = new ethers.Contract(CONTRACTS.botMarketplace, BOT_MARKETPLACE_ABI, provider);
+            botMarketplaceContract = new ethers.Contract(CONTRACTS.botMarketplace, BOT_MARKETPLACE_ABI, backendWallet);
         }
         log.important(`[Blockchain] Contracts initialized. Registry: ${CONTRACTS.botRegistry}, NFT: ${CONTRACTS.snakeBotNFT}, PariMutuel: ${CONTRACTS.pariMutuel}, Marketplace: ${CONTRACTS.botMarketplace}`);
 
@@ -898,9 +938,22 @@ function scanBotScript(content) {
             if (node.object.type === 'Identifier' && FORBIDDEN_IDENTIFIERS.has(node.object.name)) {
                 return `Forbidden access: ${node.object.name}`;
             }
-            // property name check (works for both a.constructor and a['constructor'])
-            const prop = node.property.type === 'Identifier' ? node.property.name
-                       : node.property.type === 'Literal' ? String(node.property.value) : null;
+            // property name check (works for a.constructor, a['constructor'], and a[`constructor`])
+            let prop = null;
+            if (node.property.type === 'Identifier') {
+                prop = node.property.name;
+            } else if (node.property.type === 'Literal') {
+                prop = String(node.property.value);
+            } else if (node.property.type === 'TemplateLiteral') {
+                // Static template literal with no expressions: `constructor`
+                if (node.property.expressions.length === 0 && node.property.quasis.length === 1) {
+                    prop = node.property.quasis[0].value.cooked;
+                } else {
+                    // Dynamic template literal with expressions: `${'construct' + 'or'}`
+                    // Block all computed template literal property access as suspicious
+                    return 'Forbidden: template literal property access with expressions';
+                }
+            }
             if (prop && FORBIDDEN_MEMBER_PROPS.has(prop)) {
                 return `Forbidden property access: .${prop}`;
             }
@@ -950,11 +1003,15 @@ function startBotWorker(botId, overrideArenaId) {
     }
 
     const arenaId = overrideArenaId || bot.preferredArenaId || 'performance-1';
+    // Generate a one-time WebSocket auth token for this bot session
+    const wsToken = require('crypto').randomBytes(16).toString('hex');
+    bot.wsToken = wsToken;
     log.important(`[Worker] Starting bot ${botId} for arena ${arenaId}`);
     const worker = new Worker(path.join(__dirname, 'sandbox-worker.js'), {
         workerData: {
             scriptPath: bot.scriptPath,
             botId: botId,
+            wsToken: wsToken,
             serverUrl: `ws://127.0.0.1:${PORT}?arenaId=${arenaId}` // Use explicit IPv4 loopback
         }
     });
@@ -1518,6 +1575,21 @@ class GameRoom {
             }
         });
 
+        // Lock betting on-chain when ≤5 snakes alive (once per match)
+        if (aliveCount <= 5 && !this._bettingLockSent && pariMutuelContract) {
+            this._bettingLockSent = true;
+            const matchId = this.currentMatchId;
+            (async () => {
+                try {
+                    const overrides = { gasLimit: 100_000 };
+                    const tx = await pariMutuelContract.lockBetting(matchId, overrides);
+                    log.info(`[PariMutuel] lockBetting tx sent for match ${matchId}: ${tx.hash}`);
+                } catch (e) {
+                    log.warn(`[PariMutuel] lockBetting failed for match ${matchId}: ${e.message}`);
+                }
+            })();
+        }
+
         const totalPlayers = Object.keys(this.players).length;
         if (totalPlayers > 1 && aliveCount === 1) {
             this.victoryPauseTimer = 24;
@@ -1887,6 +1959,7 @@ class GameRoom {
 
     startGame() {
         this.spawnIndex = 0;
+        this._bettingLockSent = false; // Reset betting lock flag for new match
         log.important(`[Room ${this.id}] Starting match with ${Object.keys(this.waitingRoom).length} players`);
         
         const usedSpawnIndices = new Set();
@@ -2007,6 +2080,10 @@ class GameRoom {
             botId: w.botId || w.id,
         }));
 
+        // Betting is open only during PLAYING state and when more than 5 snakes are alive
+        const aliveInMatch = displayPlayers.filter(p => p.alive).length;
+        const bettingOpen = this.gameState === 'PLAYING' && aliveInMatch > 5;
+
         const state = {
             matchId: this.currentMatchId,
             arenaId: this.id,
@@ -2031,6 +2108,7 @@ class GameRoom {
             epoch: getCurrentEpoch(),
             victoryPause: this.victoryPauseTimer > 0,
             victoryPauseTime: Math.ceil(this.victoryPauseTimer / 8),
+            bettingOpen,
         };
 
         // Record frame for replay (only during PLAYING) — deep copy mutable data
@@ -2572,6 +2650,14 @@ wss.on('connection', (ws, req) => {
                 const url = new URL(req.url, `http://${req.headers.host}`);
                 const arenaId = url.searchParams.get('arenaId');
                 const botMeta = data.botId && botRegistry[data.botId] ? botRegistry[data.botId] : null;
+                // Verify wsToken when botId is provided — prevents impersonation
+                if (data.botId && botMeta && botMeta.wsToken) {
+                    if (data.wsToken !== botMeta.wsToken) {
+                        log.warn(`[WS] Rejected join: invalid wsToken for bot ${data.botId}`);
+                        ws.send(JSON.stringify({ type: 'queued', id: null, reason: 'invalid_token' }));
+                        return;
+                    }
+                }
                 if (botMeta) {
                     data.name = botMeta.name;
                     data.botType = botMeta.botType;
@@ -3135,6 +3221,7 @@ app.post('/api/competitive/enter', async (req, res) => {
             return res.status(400).json({ error: 'wrong_recipient', message: 'Payment must be sent to the correct address' });
         }
         // Verify TX sender owns the bot's NFT (or is the seller if listed on marketplace)
+        // NOTE: NFT check runs BEFORE consuming txHash — if RPC fails, user can retry
         if (snakeBotNFTContract) {
             try {
                 const botIdBytes32 = ethers.encodeBytes32String(botId);
@@ -3156,12 +3243,13 @@ app.post('/api/competitive/enter', async (req, res) => {
                     }
                 }
             } catch (e) {
-                log.warn('[Competitive] NFT ownership check failed:', e.message);
-                // Allow entry if NFT check fails (contract may be down) — txHash still consumed
+                log.warn('[Competitive] NFT ownership check failed (RPC error):', e.message);
+                return res.status(503).json({ error: 'nft_check_failed', message: 'NFT ownership check failed, please retry' });
             }
         }
-        // Mark txHash as used
+        // Mark txHash as used and persist (only after all checks pass)
         usedEntryTxHashes.add(txHash.toLowerCase());
+        saveUsedTxHashes();
     } catch (e) {
         return res.status(400).json({ error: 'tx_verification_failed', message: 'Could not verify transaction' });
     }
@@ -3602,9 +3690,11 @@ app.get('/api/bet/pool', async (req, res) => {
             totalPoolWei: m.totalPool.toString(),
             settled: m.settled,
             cancelled: m.cancelled,
+            bettingLocked: m.bettingLocked,
+            uniqueBettors: Number(m.uniqueBettors),
             exists,
             startTime: Number(m.startTime),
-            bettingOpen: exists && !m.settled && !m.cancelled && (Date.now() / 1000 < Number(m.startTime) + 300)
+            bettingOpen: exists && !m.settled && !m.cancelled && !m.bettingLocked && (Date.now() / 1000 < Number(m.startTime) + 300)
         });
     } catch (e) {
         res.json({ matchId: mid, totalPool: '0', settled: false, exists: false, error: e.message });
@@ -3772,9 +3862,24 @@ app.get('/api/portfolio', rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
 });
 
 // Award score when user places an on-chain USDC bet (called by frontend after tx confirms)
-app.post('/api/score/bet', (req, res) => {
-    const { address, amount, matchId, botId } = req.body || {};
+app.post('/api/score/bet', async (req, res) => {
+    const { address, amount, matchId, botId, signature, timestamp } = req.body || {};
     if (!address || !amount) return res.status(400).json({ error: 'missing address or amount' });
+
+    // Require wallet signature to prevent score farming
+    if (!signature || !timestamp) {
+        return res.status(401).json({ error: 'auth_required', message: 'Wallet signature required' });
+    }
+    const ts = parseInt(timestamp);
+    if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+        return res.status(401).json({ error: 'auth_expired', message: 'Signature expired' });
+    }
+    const message = `SnakeAgents BetScore\nAddress: ${address}\nAmount: ${amount}\nTimestamp: ${timestamp}`;
+    const isValid = await verifyWalletSignature(address, message, signature);
+    if (!isValid) {
+        return res.status(401).json({ error: 'auth_invalid', message: 'Invalid signature' });
+    }
+
     const addr = address.toLowerCase();
     const pts = Math.max(1, Math.floor(parseFloat(amount) || 1));
     awardScore(addr, 'bet_activity', pts, { matchId, botId });
@@ -4428,6 +4533,175 @@ app.get('/api/admin/referral-stats', requireAdminKey, (req, res) => {
         });
     } catch (e) {
         res.status(500).json({ error: 'query_failed' });
+    }
+});
+
+// --- Admin Dashboard APIs ---
+
+// Dashboard: all-in-one data endpoint
+app.get('/api/admin/dashboard-data', requireAdminKey, (req, res) => {
+    try {
+        const allBots = Object.entries(botRegistry).map(([id, bot]) => ({
+            botId: id,
+            name: bot.name,
+            owner: bot.owner || '',
+            credits: bot.credits || 0,
+            unlimited: !!bot.unlimited,
+            running: !!bot.running,
+            workerAlive: activeWorkers.has(id),
+            botType: bot.botType || 'unknown',
+            preferredArenaId: bot.preferredArenaId || ''
+        }));
+
+        const totalBots = allBots.length;
+        const runningBots = allBots.filter(b => b.workerAlive).length;
+        const totalMatches = matchHistory.length;
+
+        // Unique users (bot owners)
+        const uniqueOwners = new Set(allBots.map(b => b.owner).filter(Boolean));
+
+        // Referral stats
+        const totalReferrals = Object.keys(referralData.users).length;
+
+        // Arena status
+        const arenaStatus = [];
+        for (const [roomId, room] of rooms) {
+            arenaStatus.push({
+                id: room.id,
+                type: room.type,
+                players: Object.keys(room.players).length,
+                maxPlayers: room.maxPlayers,
+                gameState: room.gameState,
+                matchTimeLeft: room.matchTimeLeft,
+                currentMatchId: room.currentMatchId,
+                displayMatchId: room.displayMatchId,
+                clients: room.clients.size
+            });
+        }
+
+        res.json({
+            ok: true,
+            totalBots,
+            runningBots,
+            totalMatches,
+            totalUsers: uniqueOwners.size,
+            totalReferrals,
+            bots: allBots,
+            recentMatches: matchHistory.slice(0, 100),
+            arenaStatus,
+            referralUsers: referralData.users,
+            referralRewards: referralData.rewards
+        });
+    } catch (e) {
+        log.error('[Admin] dashboard-data error:', e.message);
+        res.status(500).json({ error: 'internal_error', message: e.message });
+    }
+});
+
+// Dashboard: on-chain balances
+app.get('/api/admin/balances', requireAdminKey, async (req, res) => {
+    try {
+        if (!backendWallet) return res.status(503).json({ error: 'wallet_not_configured' });
+
+        const results = {};
+
+        // Backend wallet ETH balance
+        const walletBalance = await provider.getBalance(backendWallet.address);
+        results.backendWallet = {
+            address: backendWallet.address,
+            ethBalance: ethers.formatEther(walletBalance)
+        };
+
+        // Contract ETH balances
+        const contractNames = ['botRegistry', 'pariMutuel', 'botMarketplace'];
+        for (const name of contractNames) {
+            const addr = CONTRACTS[name];
+            if (!addr || addr === '0x0000000000000000000000000000000000000000') continue;
+            try {
+                const bal = await provider.getBalance(addr);
+                results[name] = { address: addr, ethBalance: ethers.formatEther(bal) };
+            } catch (e) {
+                results[name] = { address: addr, ethBalance: 'error', error: e.message };
+            }
+        }
+
+        // PariMutuel accumulated platform fees
+        if (pariMutuelContract) {
+            try {
+                const fees = await pariMutuelContract.accumulatedPlatformFees();
+                results.pariMutuel.accumulatedFees = ethers.formatEther(fees);
+            } catch (e) {
+                if (results.pariMutuel) results.pariMutuel.accumulatedFees = 'N/A';
+            }
+        }
+
+        // Marketplace accumulated fees
+        if (botMarketplaceContract) {
+            try {
+                const fees = await botMarketplaceContract.accumulatedFees();
+                results.botMarketplace.accumulatedFees = ethers.formatEther(fees);
+            } catch (e) {
+                if (results.botMarketplace) results.botMarketplace.accumulatedFees = 'N/A';
+            }
+        }
+
+        // USDC balances (Base Sepolia USDC)
+        const USDC_ADDRESS = process.env.USDC_ADDRESS || '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
+        try {
+            const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
+            const decimals = await usdc.decimals();
+            for (const name of contractNames) {
+                const addr = CONTRACTS[name];
+                if (!addr || addr === '0x0000000000000000000000000000000000000000') continue;
+                try {
+                    const bal = await usdc.balanceOf(addr);
+                    if (results[name]) results[name].usdcBalance = ethers.formatUnits(bal, decimals);
+                } catch (e) { /* skip */ }
+            }
+        } catch (e) {
+            // USDC contract may not exist on this chain
+        }
+
+        res.json({ ok: true, ...results });
+    } catch (e) {
+        log.error('[Admin] balances error:', e.message);
+        res.status(500).json({ error: 'query_failed', message: e.message });
+    }
+});
+
+// Dashboard: withdraw fees from contracts
+app.post('/api/admin/withdraw', requireAdminKey, async (req, res) => {
+    const { contract } = req.body || {};
+    if (!contract) return res.status(400).json({ error: 'missing_contract' });
+
+    const validContracts = ['pariMutuel', 'botMarketplace'];
+    if (!validContracts.includes(contract)) {
+        return res.status(400).json({ error: 'invalid_contract', valid: validContracts });
+    }
+
+    try {
+        let txHash;
+        if (contract === 'pariMutuel') {
+            if (!pariMutuelContract) return res.status(503).json({ error: 'contract_not_ready' });
+            txHash = await enqueueTxAsync(`admin withdrawPlatformFees (pariMutuel)`, async (overrides) => {
+                const tx = await pariMutuelContract.withdrawPlatformFees(overrides);
+                const receipt = await tx.wait();
+                log.important(`[Admin] withdrawPlatformFees (pariMutuel) confirmed: ${receipt.hash}`);
+                return receipt.hash;
+            });
+        } else if (contract === 'botMarketplace') {
+            if (!botMarketplaceContract) return res.status(503).json({ error: 'contract_not_ready' });
+            txHash = await enqueueTxAsync(`admin withdrawFees (marketplace)`, async (overrides) => {
+                const tx = await botMarketplaceContract.withdrawFees(overrides);
+                const receipt = await tx.wait();
+                log.important(`[Admin] withdrawFees (marketplace) confirmed: ${receipt.hash}`);
+                return receipt.hash;
+            });
+        }
+        res.json({ ok: true, contract, txHash });
+    } catch (e) {
+        log.error(`[Admin] withdraw ${contract} failed:`, e.message);
+        res.status(500).json({ error: 'withdraw_failed', message: e.message });
     }
 });
 

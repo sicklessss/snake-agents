@@ -4,7 +4,7 @@ const ivm = require('isolated-vm');
 const WebSocket = require('ws');
 
 // --- Worker Setup ---
-const { scriptPath, botId, serverUrl } = workerData;
+const { scriptPath, botId, wsToken, serverUrl } = workerData;
 
 const debugLog = (msg) => {
     if (parentPort) parentPort.postMessage({ type: 'debug', message: msg });
@@ -183,7 +183,18 @@ WebSocket.OPEN = 1;
 WebSocket.CLOSING = 2;
 WebSocket.CLOSED = 3;
 WebSocket.prototype.send = function(data) {
-    $_wsSend.applySync(undefined, [this._id, String(data)]);
+    // Auto-inject wsToken into join messages for authentication
+    var str = String(data);
+    if (CONFIG.wsToken && (str.indexOf('"join"') !== -1)) {
+        try {
+            var obj = JSON.parse(str);
+            if (obj && obj.type === 'join') {
+                obj.wsToken = CONFIG.wsToken;
+                str = JSON.stringify(obj);
+            }
+        } catch(e) {}
+    }
+    $_wsSend.applySync(undefined, [this._id, str]);
 };
 WebSocket.prototype.close = function() {
     $_wsClose.applySync(undefined, [this._id]);
@@ -270,7 +281,7 @@ function clearInterval(id) {
 }
 
 // --- CONFIG ---
-var CONFIG = { serverUrl: ${JSON.stringify(serverUrl)}, botId: ${JSON.stringify(botId)} };
+var CONFIG = { serverUrl: ${JSON.stringify(serverUrl)}, botId: ${JSON.stringify(botId)}, wsToken: ${JSON.stringify(wsToken || '')} };
 
 // --- Block dangerous globals ---
 var require = undefined;

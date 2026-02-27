@@ -953,9 +953,10 @@ function BotManagement() {
 }
 
 // Prediction — on-chain USDC betting via SnakeAgentsPariMutuel contract
-function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string; chainCreated?: boolean } | null; epoch: number; arenaType: 'performance' | 'competitive' }) {
+function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string; chainCreated?: boolean } | null; epoch: number; arenaType: 'performance' | 'competitive'; bettingOpen: boolean }) {
   const { isConnected, address, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
+  const { signMessageAsync } = useSignMessage();
   const { switchChainAsync } = useSwitchChain();
   const [botName, setBotName] = useState('');
   const [targetMatch, setTargetMatch] = useState('');
@@ -1053,19 +1054,18 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
 
       if (currentAllowance < usdcAmount) {
         setStatus('授权 USDC...');
-        const maxApproval = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
         const usdcApproveGas = await estimateGas({
           address: CONTRACTS.usdc as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
+          args: [CONTRACTS.pariMutuel as `0x${string}`, usdcAmount],
           account: address as `0x${string}`,
         });
         const approveTx = await writeContractAsync({
           address: CONTRACTS.usdc as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.pariMutuel as `0x${string}`, maxApproval],
+          args: [CONTRACTS.pariMutuel as `0x${string}`, usdcAmount],
           chainId: baseSepolia.id,
           ...(usdcApproveGas ? { gas: usdcApproveGas } : {}),
         });
@@ -1093,12 +1093,15 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
       setStatus('链上确认中...');
       await publicClient.waitForTransactionReceipt({ hash: betTx as `0x${string}` });
 
-      // Award score for betting
+      // Award score for betting (with wallet signature)
       try {
+        const scoreTs = Date.now().toString();
+        const scoreMsg = `SnakeAgents BetScore\nAddress: ${address}\nAmount: ${parseFloat(amount)}\nTimestamp: ${scoreTs}`;
+        const scoreSig = await signMessageAsync({ message: scoreMsg });
         await fetch('/api/score/bet', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName }),
+          body: JSON.stringify({ address, amount: parseFloat(amount), matchId: mid, botId: botName, signature: scoreSig, timestamp: scoreTs }),
         });
       } catch (_) { /* score award is best-effort */ }
 
@@ -1162,9 +1165,10 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType }: { displayMa
           </button>
         ))}
       </div>
-      <button onClick={handlePredict} disabled={busy} style={{ marginTop: '6px' }}>
-        {busy ? '⏳ ' + status : '💰 USDC 预测'}
+      <button onClick={handlePredict} disabled={busy || !bettingOpen} style={{ marginTop: '6px' }}>
+        {busy ? '⏳ ' + status : !bettingOpen ? '🔒 投注已关闭' : '💰 USDC 预测'}
       </button>
+      {!bettingOpen && !busy && <div className="muted" style={{ marginTop: '6px', color: '#ff8800' }}>剩余 ≤5 条蛇时投注关闭，请等待下一场</div>}
       {!busy && status && <div className="muted" style={{ marginTop: '6px' }}>{status}</div>}
     </div>
   );
@@ -1259,6 +1263,7 @@ function GameCanvas({
   setDisplayMatchId,
   setNextMatch,
   setEpoch,
+  setBettingOpen,
 }: {
   mode: 'performance' | 'competitive';
   setMatchId: (id: number | null) => void;
@@ -1266,6 +1271,7 @@ function GameCanvas({
   setDisplayMatchId: (id: string | null) => void;
   setNextMatch: (m: { matchId: number; displayMatchId: string } | null) => void;
   setEpoch: (n: number) => void;
+  setBettingOpen: (open: boolean) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const foodImgRef = useRef<HTMLImageElement | null>(null);
@@ -1344,6 +1350,7 @@ function GameCanvas({
         setDisplayMatchId(state.displayMatchId || null);
         setNextMatch(state.nextMatch || null);
         if (state.epoch) setEpoch(state.epoch);
+        setBettingOpen(!!state.bettingOpen);
 
         // Issue 5: Show "Epoch X #displayMatchId"
         const epochStr = state.epoch ? `Epoch ${state.epoch}` : '';
@@ -2568,6 +2575,7 @@ function App() {
   const [nextMatch, setNextMatch] = useState<{ matchId: number; displayMatchId: string; chainCreated?: boolean } | null>(null);
   const [epoch, setEpoch] = useState(1);
   const [players, setPlayers] = useState<any[]>([]);
+  const [bettingOpen, setBettingOpen] = useState(false);
   const [perfLeaderboard, setPerfLeaderboard] = useState<any[]>([]);
   const [compLeaderboard, setCompLeaderboard] = useState<any[]>([]);
   const [perfLeaderboardAll, setPerfLeaderboardAll] = useState<any[]>([]);
@@ -2715,7 +2723,7 @@ function App() {
                   )}
                   <div className="panel-section">
                     <h3>🔮 Prediction</h3>
-                    <Prediction displayMatchId={displayMatchId} nextMatch={nextMatch} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} />
+                    <Prediction displayMatchId={displayMatchId} nextMatch={nextMatch} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} bettingOpen={bettingOpen} />
                   </div>
                 </aside>
 
@@ -2727,6 +2735,7 @@ function App() {
                   setDisplayMatchId={setDisplayMatchId}
                   setNextMatch={setNextMatch}
                   setEpoch={setEpoch}
+                  setBettingOpen={setBettingOpen}
                 />
 
                 <aside className="right-panel">

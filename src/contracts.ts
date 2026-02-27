@@ -2,7 +2,7 @@
 export const CONTRACTS = {
   botRegistry: '0x98B230509E2e825Ff94Ce69aA21662101E564FA2',
   rewardDistributor: '0x6c8d215606E23BBd353ABC5f531fbB0EaEeDe037',
-  pariMutuel: '0x4bcf26A28919bBD30833a022244a3d2819317649',
+  pariMutuel: '0x4428D307E979C4F618E6BFf3a381b20F6F5d228f',
   snakeBotNFT: '0x7aC014594957c47cD822ddEA6910655C1987B84C',
   botMarketplace: '0x690c4c95317cE4C3e4848440c4ADC751781138f8',
   // USDC on Base Sepolia
@@ -33,9 +33,11 @@ export const PARI_MUTUEL_ABI = [
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }, { "internalType": "bytes32", "name": "_botId", "type": "bytes32" }, { "internalType": "uint256", "name": "_amount", "type": "uint256" }], "name": "placeBet", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }, { "internalType": "uint256", "name": "_startTime", "type": "uint256" }], "name": "createMatch", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }, { "internalType": "bytes32[]", "name": "_winners", "type": "bytes32[]" }], "name": "settleMatch", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
+  { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }], "name": "lockBetting", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }], "name": "claimWinnings", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }], "name": "claimRefund", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
-  { "inputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }], "name": "matches", "outputs": [{ "internalType": "uint256", "name": "matchId", "type": "uint256" }, { "internalType": "uint256", "name": "startTime", "type": "uint256" }, { "internalType": "uint256", "name": "endTime", "type": "uint256" }, { "internalType": "uint256", "name": "totalPool", "type": "uint256" }, { "internalType": "bool", "name": "settled", "type": "bool" }, { "internalType": "bool", "name": "cancelled", "type": "bool" }], "stateMutability": "view", "type": "function" },
+  { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }], "name": "emergencyRefundMatch", "outputs": [], "stateMutability": "nonpayable", "type": "function" },
+  { "inputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }], "name": "matches", "outputs": [{ "internalType": "uint256", "name": "matchId", "type": "uint256" }, { "internalType": "uint256", "name": "startTime", "type": "uint256" }, { "internalType": "uint256", "name": "endTime", "type": "uint256" }, { "internalType": "uint256", "name": "totalPool", "type": "uint256" }, { "internalType": "uint256", "name": "uniqueBettors", "type": "uint256" }, { "internalType": "bool", "name": "settled", "type": "bool" }, { "internalType": "bool", "name": "cancelled", "type": "bool" }, { "internalType": "bool", "name": "bettingLocked", "type": "bool" }], "stateMutability": "view", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }, { "internalType": "bytes32", "name": "", "type": "bytes32" }], "name": "botTotalBets", "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }], "stateMutability": "view", "type": "function" },
   { "inputs": [{ "internalType": "uint256", "name": "_matchId", "type": "uint256" }, { "internalType": "bytes32", "name": "_botId", "type": "bytes32" }], "name": "getCurrentOdds", "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }], "stateMutability": "view", "type": "function" },
 ] as const;

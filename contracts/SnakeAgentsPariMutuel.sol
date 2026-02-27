@@ -15,6 +15,8 @@ interface IERC20 {
  * @title SnakeAgentsPariMutuel
  * @notice Pari-mutuel betting pool for Snake Agents (USDC version)
  * @dev 10% platform rake, 90% to bettors. Uses USDC (6 decimals) on Base Sepolia.
+ *      Single-bettor matches are auto-cancelled (full refund, no rake).
+ *      Oracle can lock betting mid-match. Timeout safety valve for stuck matches.
  */
 contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
@@ -29,6 +31,9 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     // Platform rake: 10% (covers platform + bot designer rewards)
     uint256 public constant PLATFORM_RAKE = 1000;     // 10%
     uint256 public constant TOTAL_RAKE = 1000;        // 10%
+
+    // Timeout: if Oracle doesn't settle/cancel within 1 hour, anyone can trigger refund
+    uint256 public constant MATCH_TIMEOUT = 1 hours;
 
     // ============ State Variables ============
 
@@ -48,8 +53,10 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         uint256 startTime;
         uint256 endTime;
         uint256 totalPool;
+        uint256 uniqueBettors;
         bool settled;
         bool cancelled;
+        bool bettingLocked;
         bytes32[] winners;  // 1st, 2nd, 3rd place bot IDs
         uint256[] winnerPools;
     }
@@ -61,6 +68,9 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     mapping(uint256 => mapping(bytes32 => uint256)) public botTotalBets;
     mapping(uint256 => mapping(address => mapping(bytes32 => uint256[]))) public bettorBotBets;
     mapping(uint256 => mapping(address => uint256)) public bettorTotalBet;
+
+    // Track whether an address has bet on a match (for uniqueBettors counting)
+    mapping(uint256 => mapping(address => bool)) public hasBetOnMatch;
 
     mapping(address => bool) public authorizedOracles;
 
@@ -88,6 +98,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     );
 
     event MatchCancelled(uint256 indexed matchId, string reason);
+    event BettingLocked(uint256 indexed matchId);
     event WinningsClaimed(uint256 indexed matchId, address indexed bettor, uint256 amount);
     event RefundClaimed(uint256 indexed matchId, address indexed bettor, uint256 amount);
     event OracleAuthorized(address oracle);
@@ -135,6 +146,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     {
         require(_amount > 0, "Bet amount must be > 0");
         require(_botId != bytes32(0), "Invalid bot ID");
+        require(!matches[_matchId].bettingLocked, "Betting locked");
         require(block.timestamp < matches[_matchId].startTime + 5 minutes, "Betting closed");
 
         // Transfer USDC from bettor to this contract
@@ -155,7 +167,26 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         bettorBotBets[_matchId][msg.sender][_botId].push(betIndex);
         matches[_matchId].totalPool += _amount;
 
+        // Track unique bettors
+        if (!hasBetOnMatch[_matchId][msg.sender]) {
+            hasBetOnMatch[_matchId][msg.sender] = true;
+            matches[_matchId].uniqueBettors++;
+        }
+
         emit BetPlaced(_matchId, msg.sender, _botId, _amount, betIndex);
+    }
+
+    /**
+     * @notice Oracle locks betting (e.g. when ≤5 snakes alive)
+     */
+    function lockBetting(uint256 _matchId)
+        external
+        onlyOracle
+        matchExists(_matchId)
+        matchNotSettled(_matchId)
+    {
+        matches[_matchId].bettingLocked = true;
+        emit BettingLocked(_matchId);
     }
 
     function createMatch(uint256 _matchId, uint256 _startTime)
@@ -170,8 +201,10 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
             startTime: _startTime,
             endTime: 0,
             totalPool: 0,
+            uniqueBettors: 0,
             settled: false,
             cancelled: false,
+            bettingLocked: false,
             winners: new bytes32[](0),
             winnerPools: new uint256[](0)
         });
@@ -179,6 +212,9 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         emit MatchCreated(_matchId, _startTime);
     }
 
+    /**
+     * @notice Settle a match. If only 1 unique bettor, auto-cancels for full refund.
+     */
     function settleMatch(
         uint256 _matchId,
         bytes32[] calldata _winners
@@ -193,6 +229,15 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         require(block.timestamp >= matches[_matchId].startTime, "Match not started");
 
         Match storage matchData = matches[_matchId];
+
+        // Single-bettor match: auto-cancel, full refund (no rake)
+        if (matchData.uniqueBettors <= 1) {
+            matchData.cancelled = true;
+            matchData.endTime = block.timestamp;
+            emit MatchCancelled(_matchId, "Single bettor - auto refund");
+            return;
+        }
+
         matchData.settled = true;
         matchData.endTime = block.timestamp;
         matchData.winners = _winners;
@@ -224,6 +269,22 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     {
         matches[_matchId].cancelled = true;
         emit MatchCancelled(_matchId, _reason);
+    }
+
+    /**
+     * @notice Anyone can trigger refund if Oracle fails to settle/cancel within MATCH_TIMEOUT.
+     */
+    function emergencyRefundMatch(uint256 _matchId)
+        external
+        nonReentrant
+        matchExists(_matchId)
+    {
+        Match storage matchData = matches[_matchId];
+        require(!matchData.settled && !matchData.cancelled, "Already finalized");
+        require(block.timestamp > matchData.startTime + MATCH_TIMEOUT, "Not timed out yet");
+
+        matchData.cancelled = true;
+        emit MatchCancelled(_matchId, "Timeout - auto cancelled");
     }
 
     function claimWinnings(uint256 _matchId)
@@ -308,18 +369,25 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         // 90% to bettors (100% - 10% platform rake)
         uint256 payoutPool = (totalPool * (PERCENTAGE_BASE - TOTAL_RAKE)) / PERCENTAGE_BASE;
 
+        // Calculate this place's share and total allocated shares
+        // When fewer than 3 winners, redistribute proportionally so no funds are stuck
         uint256 prizeShare;
-        if (place == 1) {
-            prizeShare = FIRST_PLACE_SHARE;
-        } else if (place == 2) {
-            prizeShare = SECOND_PLACE_SHARE;
-        } else if (place == 3) {
-            prizeShare = THIRD_PLACE_SHARE;
-        } else {
+        uint256 totalAllocatedShare = 0;
+        for (uint j = 0; j < matchData.winners.length; j++) {
+            uint256 s;
+            if (j == 0) s = FIRST_PLACE_SHARE;
+            else if (j == 1) s = SECOND_PLACE_SHARE;
+            else s = THIRD_PLACE_SHARE;
+            totalAllocatedShare += s;
+            if (j + 1 == place) prizeShare = s;
+        }
+
+        if (prizeShare == 0 || totalAllocatedShare == 0) {
             return 0;
         }
 
-        uint256 botPrizePool = (payoutPool * prizeShare) / PERCENTAGE_BASE;
+        // Scale: botPrizePool = payoutPool * (prizeShare / totalAllocatedShare)
+        uint256 botPrizePool = (payoutPool * prizeShare) / totalAllocatedShare;
         uint256 totalBetOnBot = botTotalBets[_matchId][bet.botId];
 
         if (totalBetOnBot == 0) {

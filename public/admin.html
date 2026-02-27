@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snake Agents Admin</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5}
+.login-screen{display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px}
+.login-screen h1{font-size:24px;color:#58a6ff}
+.login-screen input{padding:10px 16px;width:320px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px}
+.login-screen button{padding:10px 24px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:14px;cursor:pointer}
+.login-screen button:hover{background:#2ea043}
+.login-error{color:#f85149;font-size:13px}
+.container{max-width:1400px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #21262d;margin-bottom:20px}
+header h1{font-size:20px;color:#58a6ff}
+header .actions{display:flex;gap:8px;align-items:center}
+.btn{padding:6px 14px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#c9d1d9;cursor:pointer;font-size:13px;white-space:nowrap}
+.btn:hover{background:#30363d}
+.btn-green{background:#238636;border-color:#238636;color:#fff}
+.btn-green:hover{background:#2ea043}
+.btn-red{background:#da3633;border-color:#da3633;color:#fff}
+.btn-red:hover{background:#f85149}
+.btn-blue{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn-blue:hover{background:#388bfd}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
+.card .label{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+.card .value{font-size:28px;font-weight:700;color:#58a6ff;margin-top:4px}
+.section{background:#161b22;border:1px solid #21262d;border-radius:8px;margin-bottom:20px;overflow:hidden}
+.section-header{padding:12px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;justify-content:space-between}
+.section-header h2{font-size:16px;color:#c9d1d9}
+.section-body{padding:16px;overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:8px 12px;font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #21262d}
+td{padding:8px 12px;border-bottom:1px solid #21262d;font-size:13px}
+tr:last-child td{border-bottom:none}
+tr:hover{background:#1c2128}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-green{background:#0d421d;color:#3fb950}
+.badge-red{background:#4a1e1e;color:#f85149}
+.badge-yellow{background:#3d2e00;color:#d29922}
+.badge-blue{background:#0c2d6b;color:#58a6ff}
+.balance-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.balance-card{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:14px}
+.balance-card h3{font-size:14px;color:#58a6ff;margin-bottom:8px}
+.balance-card .addr{font-size:11px;color:#8b949e;word-break:break-all}
+.balance-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.balance-row .lbl{color:#8b949e;font-size:13px}
+.balance-row .val{color:#c9d1d9;font-weight:600}
+.toast{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;font-size:13px;z-index:9999;animation:slidein .3s ease}
+.toast-ok{background:#238636}
+.toast-err{background:#da3633}
+@keyframes slidein{from{transform:translateY(40px);opacity:0}to{transform:translateY(0);opacity:1}}
+.hidden{display:none!important}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.referral-list{max-height:400px;overflow-y:auto}
+#lastUpdate{font-size:12px;color:#8b949e}
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="loginScreen" class="login-screen">
+  <h1>Snake Agents Admin</h1>
+  <input type="password" id="keyInput" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">Login</button>
+  <div id="loginError" class="login-error hidden"></div>
+</div>
+
+<!-- Dashboard -->
+<div id="dashboard" class="hidden">
+  <div class="container">
+    <header>
+      <h1>Snake Agents Admin</h1>
+      <div class="actions">
+        <span id="lastUpdate"></span>
+        <button class="btn" onclick="refreshDashboard()">Refresh</button>
+        <button class="btn btn-red" onclick="doLogout()">Logout</button>
+      </div>
+    </header>
+
+    <!-- Overview Cards -->
+    <div class="cards">
+      <div class="card"><div class="label">Total Bots</div><div class="value" id="statBots">-</div></div>
+      <div class="card"><div class="label">Running</div><div class="value" id="statRunning">-</div></div>
+      <div class="card"><div class="label">Total Matches</div><div class="value" id="statMatches">-</div></div>
+      <div class="card"><div class="label">Users</div><div class="value" id="statUsers">-</div></div>
+      <div class="card"><div class="label">Referrals</div><div class="value" id="statReferrals">-</div></div>
+    </div>
+
+    <!-- Fund Management -->
+    <div class="section">
+      <div class="section-header">
+        <h2>Fund Management</h2>
+        <button class="btn btn-blue" id="btnRefreshBal" onclick="refreshBalances()">Refresh Balances</button>
+      </div>
+      <div class="section-body">
+        <div class="balance-grid" id="balanceGrid">
+          <div style="color:#8b949e">Click "Refresh Balances" to load on-chain data</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arena Status -->
+    <div class="section">
+      <div class="section-header"><h2>Arena Status</h2></div>
+      <div class="section-body">
+        <table>
+          <thead><tr><th>Arena</th><th>Type</th><th>State</th><th>Players</th><th>Time Left</th><th>Match</th><th>Viewers</th></tr></thead>
+          <tbody id="arenaTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Bot Management -->
+    <div class="section">
+      <div class="section-header"><h2>Bot Management</h2></div>
+      <div class="section-body">
+        <table>
+          <thead><tr><th>Name</th><th>Bot ID</th><th>Owner</th><th>Credits</th><th>Type</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="botTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Match History -->
+    <div class="section">
+      <div class="section-header"><h2>Recent Matches (last 100)</h2></div>
+      <div class="section-body">
+        <table>
+          <thead><tr><th>#</th><th>Arena</th><th>Winner</th><th>Score</th><th>Players</th><th>Time</th></tr></thead>
+          <tbody id="matchTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Referral Stats -->
+    <div class="section">
+      <div class="section-header"><h2>Referral Stats</h2></div>
+      <div class="section-body referral-list">
+        <table>
+          <thead><tr><th>User</th><th>Inviter</th><th>Registered</th></tr></thead>
+          <tbody id="referralTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API_BASE = '';
+let adminKey = sessionStorage.getItem('snake_admin_key') || '';
+let refreshTimer = null;
+
+// --- Auth ---
+async function doLogin() {
+  const key = document.getElementById('keyInput').value.trim();
+  if (!key) return;
+  try {
+    const r = await apiFetch('/api/admin/dashboard-data');
+    if (r.ok) {
+      adminKey = key;
+      sessionStorage.setItem('snake_admin_key', key);
+      showDashboard();
+    }
+  } catch (e) {
+    // retry with the new key
+    adminKey = key;
+    try {
+      const r = await apiFetch('/api/admin/dashboard-data');
+      if (r.ok) {
+        sessionStorage.setItem('snake_admin_key', key);
+        showDashboard();
+        return;
+      }
+    } catch (e2) {}
+    document.getElementById('loginError').textContent = 'Invalid admin key';
+    document.getElementById('loginError').classList.remove('hidden');
+    adminKey = '';
+  }
+}
+
+function doLogout() {
+  adminKey = '';
+  sessionStorage.removeItem('snake_admin_key');
+  clearInterval(refreshTimer);
+  document.getElementById('dashboard').classList.add('hidden');
+  document.getElementById('loginScreen').classList.remove('hidden');
+  document.getElementById('keyInput').value = '';
+}
+
+function showDashboard() {
+  document.getElementById('loginScreen').classList.add('hidden');
+  document.getElementById('dashboard').classList.remove('hidden');
+  refreshDashboard();
+  refreshTimer = setInterval(refreshDashboard, 30000);
+}
+
+// --- API Helper ---
+async function apiFetch(path, opts = {}) {
+  const resp = await fetch(API_BASE + path, {
+    ...opts,
+    headers: { 'x-api-key': adminKey, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
+// --- Dashboard Data ---
+async function refreshDashboard() {
+  try {
+    const data = await apiFetch('/api/admin/dashboard-data');
+    document.getElementById('statBots').textContent = data.totalBots;
+    document.getElementById('statRunning').textContent = data.runningBots;
+    document.getElementById('statMatches').textContent = data.totalMatches;
+    document.getElementById('statUsers').textContent = data.totalUsers;
+    document.getElementById('statReferrals').textContent = data.totalReferrals;
+    document.getElementById('lastUpdate').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+
+    renderArenas(data.arenaStatus || []);
+    renderBots(data.bots || []);
+    renderMatches(data.recentMatches || []);
+    renderReferrals(data.referralUsers || {});
+  } catch (e) {
+    if (e.message.includes('401')) { doLogout(); return; }
+    toast('Failed to refresh: ' + e.message, true);
+  }
+}
+
+// --- Arenas ---
+function renderArenas(arenas) {
+  const tb = document.getElementById('arenaTable');
+  if (!arenas.length) { tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No active arenas</td></tr>'; return; }
+  tb.innerHTML = arenas.map(a => `<tr>
+    <td>${esc(a.id)}</td>
+    <td>${esc(a.type)}</td>
+    <td><span class="badge ${a.gameState==='PLAYING'?'badge-green':a.gameState==='COUNTDOWN'?'badge-yellow':'badge-blue'}">${esc(a.gameState)}</span></td>
+    <td>${a.players}/${a.maxPlayers}</td>
+    <td>${a.matchTimeLeft}s</td>
+    <td>${esc(a.displayMatchId||'')}</td>
+    <td>${a.clients}</td>
+  </tr>`).join('');
+}
+
+// --- Bots ---
+function renderBots(bots) {
+  const tb = document.getElementById('botTable');
+  if (!bots.length) { tb.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No bots</td></tr>'; return; }
+  tb.innerHTML = bots.map(b => `<tr>
+    <td>${esc(b.name)}</td>
+    <td style="font-size:11px;color:#8b949e">${esc(b.botId)}</td>
+    <td style="font-size:11px">${shortAddr(b.owner)}</td>
+    <td>${b.unlimited ? '<span class="badge badge-blue">Unlimited</span>' : b.credits}</td>
+    <td>${esc(b.botType)}</td>
+    <td>${b.workerAlive ? '<span class="badge badge-green">Running</span>' : '<span class="badge badge-red">Stopped</span>'}</td>
+    <td>
+      ${b.workerAlive
+        ? `<button class="btn btn-red" onclick="botAction('stop','${esc(b.botId)}')">Stop</button>`
+        : `<button class="btn btn-green" onclick="botAction('start','${esc(b.botId)}')">Start</button>`}
+      <button class="btn" onclick="botAction('topup','${esc(b.botId)}')">+5 Credits</button>
+    </td>
+  </tr>`).join('');
+}
+
+async function botAction(action, botId) {
+  try {
+    if (action === 'start') {
+      await apiFetch('/api/bot/start', { method: 'POST', body: JSON.stringify({ botId }) });
+      toast('Bot started: ' + botId);
+    } else if (action === 'stop') {
+      await apiFetch('/api/bot/stop', { method: 'POST', body: JSON.stringify({ botId }) });
+      toast('Bot stopped: ' + botId);
+    } else if (action === 'topup') {
+      await apiFetch('/api/bot/topup', { method: 'POST', body: JSON.stringify({ botId, amount: 0.01 }) });
+      toast('Credits added: ' + botId);
+    }
+    setTimeout(refreshDashboard, 500);
+  } catch (e) {
+    toast('Action failed: ' + e.message, true);
+  }
+}
+
+// --- Matches ---
+function renderMatches(matches) {
+  const tb = document.getElementById('matchTable');
+  if (!matches.length) { tb.innerHTML = '<tr><td colspan="6" style="color:#8b949e">No matches yet</td></tr>'; return; }
+  tb.innerHTML = matches.map(m => `<tr>
+    <td>${m.matchId || '-'}</td>
+    <td>${esc(m.arenaId||'')}</td>
+    <td>${esc(m.winner||'')}</td>
+    <td>${m.score||0}</td>
+    <td>${(m.participants||[]).length}</td>
+    <td style="font-size:12px;color:#8b949e">${m.timestamp ? new Date(m.timestamp).toLocaleString() : ''}</td>
+  </tr>`).join('');
+}
+
+// --- Referrals ---
+function renderReferrals(users) {
+  const tb = document.getElementById('referralTable');
+  const entries = Object.entries(users);
+  if (!entries.length) { tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e">No referrals</td></tr>'; return; }
+  tb.innerHTML = entries.map(([addr, info]) => `<tr>
+    <td style="font-size:12px">${shortAddr(addr)}</td>
+    <td style="font-size:12px">${shortAddr(info.inviter||'')}</td>
+    <td style="font-size:12px;color:#8b949e">${info.registeredAt ? new Date(info.registeredAt).toLocaleString() : ''}</td>
+  </tr>`).join('');
+}
+
+// --- Balances ---
+async function refreshBalances() {
+  const btn = document.getElementById('btnRefreshBal');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Loading...';
+  try {
+    const data = await apiFetch('/api/admin/balances');
+    const grid = document.getElementById('balanceGrid');
+    grid.innerHTML = '';
+
+    // Backend Wallet
+    if (data.backendWallet) {
+      grid.innerHTML += balanceCard('Backend Wallet', data.backendWallet.address, [
+        ['ETH', data.backendWallet.ethBalance]
+      ]);
+    }
+
+    // Contracts
+    const contracts = [
+      ['Bot Registry', 'botRegistry'],
+      ['PariMutuel', 'pariMutuel'],
+      ['Bot Marketplace', 'botMarketplace']
+    ];
+    for (const [label, key] of contracts) {
+      const c = data[key];
+      if (!c) continue;
+      const rows = [['ETH', c.ethBalance]];
+      if (c.usdcBalance) rows.push(['USDC', c.usdcBalance]);
+      if (c.accumulatedFees && c.accumulatedFees !== 'N/A') {
+        rows.push(['Withdrawable Fees', c.accumulatedFees + ' ETH']);
+      }
+      const withdrawBtn = (key === 'pariMutuel' || key === 'botMarketplace') && c.accumulatedFees && c.accumulatedFees !== 'N/A' && parseFloat(c.accumulatedFees) > 0
+        ? `<button class="btn btn-green" style="margin-top:8px;width:100%" onclick="doWithdraw('${key}')">Withdraw Fees</button>`
+        : '';
+      grid.innerHTML += balanceCard(label, c.address, rows, withdrawBtn);
+    }
+  } catch (e) {
+    toast('Balance query failed: ' + e.message, true);
+  }
+  btn.disabled = false;
+  btn.textContent = 'Refresh Balances';
+}
+
+function balanceCard(title, addr, rows, extra='') {
+  return `<div class="balance-card">
+    <h3>${esc(title)}</h3>
+    <div class="addr">${esc(addr)}</div>
+    ${rows.map(([l,v]) => `<div class="balance-row"><span class="lbl">${esc(l)}</span><span class="val">${esc(String(v))}</span></div>`).join('')}
+    ${extra}
+  </div>`;
+}
+
+async function doWithdraw(contract) {
+  if (!confirm(`Withdraw fees from ${contract}?`)) return;
+  try {
+    const r = await apiFetch('/api/admin/withdraw', {
+      method: 'POST',
+      body: JSON.stringify({ contract })
+    });
+    toast('Withdraw submitted! TX: ' + (r.txHash || 'pending'));
+    setTimeout(refreshBalances, 3000);
+  } catch (e) {
+    toast('Withdraw failed: ' + e.message, true);
+  }
+}
+
+// --- Utils ---
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function shortAddr(a) { return a && a.length > 10 ? a.slice(0,6)+'...'+a.slice(-4) : (a||'-'); }
+function toast(msg, isErr) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (isErr ? 'toast-err' : 'toast-ok');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// --- Init ---
+if (adminKey) {
+  // Try auto-login with stored key
+  apiFetch('/api/admin/dashboard-data').then(data => {
+    if (data.ok) showDashboard();
+    else doLogout();
+  }).catch(() => doLogout());
+} else {
+  document.getElementById('loginScreen').classList.remove('hidden');
+}
+</script>
+</body>
+</html>
