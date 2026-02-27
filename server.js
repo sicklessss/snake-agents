@@ -2792,25 +2792,32 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         }
         log.important('[Register] Bot ' + botMeta.name + ' (' + botId + ') claimed via regCode by ' + (owner || 'unknown'));
 
-        // Create bot on-chain in background (don't block HTTP response)
+        // Create bot on-chain and WAIT for confirmation before responding
         if (botRegistryContract) {
             const botIdBytes32 = ethers.encodeBytes32String(botId);
-            (async () => {
-                try {
-                    const existing = await botRegistryContract.getBotById(botIdBytes32);
-                    if (existing && existing.botId === botIdBytes32) return; // already on-chain
-                } catch (_) {}
-                enqueueTx(`createBot ${botId}`, async (overrides) => {
+            try {
+                const existing = await botRegistryContract.getBotById(botIdBytes32);
+                if (existing && existing.botId === botIdBytes32) {
+                    log.important(`[Blockchain] Bot ${botId} already on-chain, skipping createBot`);
+                    return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
+                }
+            } catch (_) {}
+            try {
+                await enqueueTxAsync(`createBot ${botId} (regCode)`, async (overrides) => {
                     const tx = await botRegistryContract.createBot(
                         botIdBytes32, botMeta.name, ethers.ZeroAddress, overrides
                     );
                     await tx.wait(1, 60000);
                     log.important(`[Blockchain] Bot ${botId} created on-chain via regCode claim`);
                 });
-            })();
+                return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
+            } catch (e) {
+                log.error(`[Register] createBot on-chain failed for ${botId}:`, e.message);
+                return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: false, message: 'Bot claimed but on-chain creation failed: ' + e.message });
+            }
         }
 
-        return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: true });
+        return res.json({ ok: true, id: botId, name: botMeta.name, onChainReady: !botRegistryContract });
     }
 
     const safeName = (name || 'AgentBot').toString().slice(0, MAX_NAME_LEN);
@@ -2861,29 +2868,33 @@ app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (r
         saveBotRegistry();
     }
 
-    // Create bot on-chain in background (don't block HTTP response)
-    let onChainOk = true; // optimistic — will be created in background
+    // Create bot on-chain and WAIT for confirmation
+    let onChainOk = true;
     if (botRegistryContract) {
         const botIdBytes32 = ethers.encodeBytes32String(id);
-        (async () => {
+        try {
+            const existing = await botRegistryContract.getBotById(botIdBytes32);
+            if (existing && existing.botId === botIdBytes32) {
+                log.important(`[Blockchain] Bot ${id} already exists on-chain, skipping createBot`);
+            }
+        } catch (_) {
+            // Bot not on-chain yet, create it
             try {
-                const existing = await botRegistryContract.getBotById(botIdBytes32);
-                if (existing && existing.botId === botIdBytes32) {
-                    log.important(`[Blockchain] Bot ${id} already exists on-chain, skipping createBot`);
-                    return;
-                }
-            } catch (_) {}
-            enqueueTx(`createBot ${id}`, async (overrides) => {
-                const tx = await botRegistryContract.createBot(
-                    botIdBytes32,
-                    safeName,
-                    ethers.ZeroAddress,
-                    overrides
-                );
-                await tx.wait(1, 60000);
-                log.important(`[Blockchain] Bot ${id} created on-chain via /register`);
-            });
-        })();
+                await enqueueTxAsync(`createBot ${id}`, async (overrides) => {
+                    const tx = await botRegistryContract.createBot(
+                        botIdBytes32,
+                        safeName,
+                        ethers.ZeroAddress,
+                        overrides
+                    );
+                    await tx.wait(1, 60000);
+                    log.important(`[Blockchain] Bot ${id} created on-chain via /register`);
+                });
+            } catch (e) {
+                log.error(`[Register] createBot on-chain failed for ${id}:`, e.message);
+                onChainOk = false;
+            }
+        }
     }
 
     // Award registration bonus (once per wallet, atomic check-and-set to prevent race condition)
