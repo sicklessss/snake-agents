@@ -97,7 +97,7 @@ const { ethers } = require('ethers');
 const CONTRACTS = {
     botRegistry: process.env.BOT_REGISTRY_CONTRACT || '0x98B230509E2e825Ff94Ce69aA21662101E564FA2',
     rewardDistributor: process.env.REWARD_DISTRIBUTOR_CONTRACT || '0x6c8d215606E23BBd353ABC5f531fbB0EaEeDe037',
-    pariMutuel: process.env.PARIMUTUEL_CONTRACT || '0x4428D307E979C4F618E6BFf3a381b20F6F5d228f',
+    pariMutuel: process.env.PARIMUTUEL_CONTRACT || '0xeEd40E9159F7d695cf9cD407E4f9bAD6182d078d',
     snakeBotNFT: process.env.NFT_CONTRACT || '0x7aC014594957c47cD822ddEA6910655C1987B84C',
     referralRewards: process.env.REFERRAL_CONTRACT || '0xA89FBd57Dd34d89F7D54a1980e6875fee5F2B819',
     botMarketplace: process.env.BOT_MARKETPLACE_CONTRACT || '0x690c4c95317cE4C3e4848440c4ADC751781138f8'
@@ -230,9 +230,15 @@ const PARI_MUTUEL_ABI = [
     "function getCurrentOdds(uint256 _matchId, bytes32 _botId) external view returns (uint256)",
     "function accumulatedPlatformFees() external view returns (uint256)",
     "function withdrawPlatformFees() external",
+    "function pendingRunnerRewards(bytes32) external view returns (uint256)",
+    "function totalRunnerRewardsAccumulated() external view returns (uint256)",
+    "function getRunnerRewardStats() external view returns (uint256)",
+    "function claimRunnerRewards(bytes32 _botId) external",
+    "function claimRunnerRewardsBatch(bytes32[] calldata _botIds) external",
     "event BetPlaced(uint256 indexed matchId, address indexed bettor, bytes32 indexed botId, uint256 amount, uint256 betIndex)",
     "event MatchSettled(uint256 indexed matchId, bytes32[] winners, uint256 totalPool, uint256 platformRake, uint256 botRewards)",
-    "event BettingLocked(uint256 indexed matchId)"
+    "event BettingLocked(uint256 indexed matchId)",
+    "event RunnerRewardsClaimed(bytes32 indexed botId, address indexed owner, uint256 amount)"
 ];
 
 const BOT_MARKETPLACE_ABI = [
@@ -1764,8 +1770,8 @@ class GameRoom {
             }
         });
 
-        // Lock betting on-chain when ≤5 snakes alive (once per match)
-        if (aliveCount <= 5 && !this._bettingLockSent && pariMutuelContract) {
+        // Lock betting on-chain 10 seconds after match starts (once per match)
+        if (this.matchTimeLeft <= (MATCH_DURATION - 10) && !this._bettingLockSent && pariMutuelContract) {
             this._bettingLockSent = true;
             const matchId = this.currentMatchId;
             enqueueTx(`lockBetting ${matchId}`, async (overrides) => {
@@ -2285,9 +2291,8 @@ class GameRoom {
             botId: w.botId || w.id,
         }));
 
-        // Betting is open only during PLAYING state and when more than 5 snakes are alive
-        const aliveInMatch = displayPlayers.filter(p => p.alive).length;
-        const bettingOpen = this.gameState === 'PLAYING' && aliveInMatch > 5;
+        // Betting is open only during PLAYING state and within first 10 seconds
+        const bettingOpen = this.gameState === 'PLAYING' && this.matchTimeLeft > (MATCH_DURATION - 10);
 
         const state = {
             matchId: this.currentMatchId,
@@ -2830,8 +2835,12 @@ const MAX_WS_PER_IP = parseInt(process.env.MAX_WS_PER_IP) || 10;
 const _wsIpCount = new Map(); // ip -> count
 
 wss.on('connection', (ws, req) => {
-    // Per-IP connection limit
-    const wsIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    // Per-IP connection limit (use CF real IP headers, fallback to remoteAddress)
+    const wsIp = req.headers['cf-connecting-ip']
+        || req.headers['x-real-ip']
+        || req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+        || req.socket.remoteAddress
+        || 'unknown';
     const currentCount = _wsIpCount.get(wsIp) || 0;
     if (currentCount >= MAX_WS_PER_IP) {
         log.warn(`[WS] Rejected connection from ${wsIp}: limit ${MAX_WS_PER_IP} reached`);
@@ -3185,7 +3194,9 @@ app.get('/api/bot/:botId', (req, res) => {
     if (!isValidBotId(req.params.botId)) return res.status(400).json({ error: 'invalid_bot_id' });
     const bot = botRegistry[req.params.botId];
     if (!bot) return res.status(404).json({ error: 'bot_not_found' });
-    res.json(bot);
+    // Strip sensitive fields before returning
+    const { wsToken: _wt, scriptPath: _sp, regCode: _rc, uploadIp: _ui, ...safeBotData } = bot;
+    res.json(safeBotData);
 });
 
 app.post('/api/bot/topup', requireAdminKey, (req, res) => {
@@ -3398,7 +3409,7 @@ app.get('/api/matches/active', (req, res) => {
             gameState: room.gameState,
             timeLeft: room.matchTimeLeft,
             players: Object.keys(room.players).length,
-            bettingOpen: room.gameState === 'PLAYING' && aliveCount > 5,
+            bettingOpen: room.gameState === 'PLAYING' && room.matchTimeLeft > (MATCH_DURATION - 10),
         });
         if (room.nextMatch) {
             matches.push({
@@ -4013,6 +4024,47 @@ app.get('/api/bet/winnings', async (req, res) => {
         res.json({ winnings: ethers.formatUnits(w, 6), winningsWei: w.toString() }); // USDC 6 decimals
     } catch (e) {
         res.json({ winnings: '0', error: e.message });
+    }
+});
+
+// Runner rewards stats — total accumulated runner pool (visible to all users)
+app.get('/api/runner-rewards/stats', async (req, res) => {
+    if (!pariMutuelContract) return res.json({ totalAccumulated: '0' });
+    try {
+        const total = await pariMutuelContract.totalRunnerRewardsAccumulated();
+        res.json({ totalAccumulated: ethers.formatUnits(total, 6) });
+    } catch (e) {
+        res.json({ totalAccumulated: '0', error: e.message });
+    }
+});
+
+// Runner rewards pending for a specific wallet (queries all bots owned by address)
+app.get('/api/runner-rewards/pending', rateLimit({ windowMs: 60_000, max: 10 }), async (req, res) => {
+    const { address } = req.query;
+    if (!address) return res.status(400).json({ error: 'missing address' });
+    if (!pariMutuelContract || !botRegistryContract) return res.json({ bots: [], total: '0' });
+    try {
+        // Get all bots owned by this address from BotRegistry
+        const botIds = await botRegistryContract.getOwnerBots(address);
+        const bots = [];
+        let totalWei = BigInt(0);
+        for (const botId of botIds) {
+            const pending = await pariMutuelContract.pendingRunnerRewards(botId);
+            if (pending > 0n) {
+                const botData = await botRegistryContract.getBotById(botId);
+                bots.push({
+                    botId: botId,
+                    botName: botData.botName,
+                    pending: ethers.formatUnits(pending, 6),
+                    pendingWei: pending.toString(),
+                });
+                totalWei += pending;
+            }
+        }
+        res.json({ bots, total: ethers.formatUnits(totalWei, 6), totalWei: totalWei.toString() });
+    } catch (e) {
+        log.error(`[RunnerRewards] Error fetching pending for ${address}: ${e.message}`);
+        res.json({ bots: [], total: '0', error: e.message });
     }
 });
 
@@ -4787,20 +4839,32 @@ app.post('/api/referral/record', async (req, res) => {
             if (!tx || tx.to?.toLowerCase() !== CONTRACTS.botRegistry.toLowerCase()) {
                 return res.status(400).json({ error: 'invalid_tx' });
             }
+            // Verify tx sender matches the claimed user
+            if (tx.from.toLowerCase() !== user.toLowerCase()) {
+                return res.status(400).json({ error: 'invalid_tx', message: 'Transaction sender does not match user' });
+            }
             // Verify function selector is registerBot(bytes32,address) = 0x... first 4 bytes
             const registerBotSelector = ethers.id('registerBot(bytes32,address)').slice(0, 10); // "0x" + 8 hex chars
             if (!tx.data || !tx.data.startsWith(registerBotSelector)) {
                 return res.status(400).json({ error: 'invalid_tx', message: 'Transaction is not a registerBot call' });
+            }
+            // Prevent txHash replay for referrals
+            const txKey = 'ref:' + txHash.toLowerCase();
+            if (usedEntryTxHashes.has(txKey)) {
+                return res.status(400).json({ error: 'tx_already_used', message: 'This transaction has already been used for referral' });
             }
             // Wait for confirmation
             const receipt = await provider.waitForTransaction(txHash, 1, 30000);
             if (!receipt || receipt.status !== 1) {
                 return res.status(400).json({ error: 'tx_failed' });
             }
+            // Mark txHash as used for referrals
+            usedEntryTxHashes.add(txKey);
+            saveUsedTxHashes();
         } catch (e) {
             return res.status(400).json({ error: 'tx_verification_failed' });
         }
-        
+
         const success = recordReferral(user, inviter, txHash, parseFloat(amount) || 0.01);
         
         if (success) {
@@ -4994,7 +5058,7 @@ app.get('/api/admin/balances', requireAdminKey, async (req, res) => {
         if (pariMutuelContract) {
             try {
                 const fees = await pariMutuelContract.accumulatedPlatformFees();
-                results.pariMutuel.accumulatedFees = ethers.formatEther(fees);
+                results.pariMutuel.accumulatedFees = ethers.formatUnits(fees, 6);
             } catch (e) {
                 if (results.pariMutuel) results.pariMutuel.accumulatedFees = 'N/A';
             }

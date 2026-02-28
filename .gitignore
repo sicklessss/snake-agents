@@ -10,3 +10,13 @@ match_counters.json
 dist/
 artifacts/
 cache/
+.DS_Store
+
+# Test & debug scripts
+test-*.js
+debug*.js
+claim-all*.js
+transfer-ownership.js
+
+# Deployment scripts (contain hardcoded keys)
+deploy-parimutuel.js

@@ -1144,15 +1144,16 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
   return (
     <div className="panel-card">
       <div className="panel-row"><span>选择比赛</span><span>Epoch {epoch}</span></div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', marginBottom: '6px' }}>
-        {activeMatches.filter(m => m.arenaId === arenaId && (m.gameState === 'PLAYING' || ((m.gameState === 'NEXT' || m.gameState === 'FUTURE') && m.chainCreated))).map(m => {
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px', marginBottom: '6px' }}>
+        {activeMatches.filter(m => m.arenaId === arenaId && (m.gameState === 'PLAYING' || m.gameState === 'COUNTDOWN' || m.gameState === 'GAMEOVER' || m.gameState === 'NEXT' || m.gameState === 'FUTURE')).map(m => {
           const isCurrent = m.displayMatchId === displayMatchId;
           const selected = targetMatch === m.displayMatchId;
           const isFuture = m.gameState === 'NEXT' || m.gameState === 'FUTURE';
+          const canBetThis = m.bettingOpen || (isFuture && m.chainCreated);
           return (
             <button key={m.displayMatchId} onClick={() => setTargetMatch(m.displayMatchId)} type="button"
-              style={{ fontSize: '0.7rem', padding: '3px 6px', background: selected ? 'var(--neon-green)' : 'transparent', color: selected ? '#000' : isCurrent ? 'var(--neon-green)' : isFuture ? '#66aaff' : '#aaa', border: `1px solid ${isCurrent ? 'var(--neon-green)' : isFuture ? '#3366aa' : m.bettingOpen ? '#555' : '#333'}`, opacity: m.bettingOpen ? 1 : 0.5 }}>
-              {m.displayMatchId}{isCurrent ? '★' : ''}{isFuture ? '⏳' : ''}{!m.bettingOpen ? '🔒' : ''}
+              style={{ fontSize: '0.82rem', padding: '6px 8px', borderRadius: '6px', background: selected ? 'var(--neon-green)' : 'transparent', color: selected ? '#000' : isCurrent ? 'var(--neon-green)' : isFuture ? '#66aaff' : '#aaa', border: `1px solid ${isCurrent ? 'var(--neon-green)' : isFuture ? '#3366aa' : canBetThis ? '#555' : '#333'}`, opacity: canBetThis ? 1 : 0.5, fontFamily: 'Orbitron, monospace', fontWeight: 'bold' }}>
+              {m.displayMatchId}{isCurrent ? ' ★' : ''}{isFuture ? ' ⏳' : ''}{!canBetThis ? ' 🔒' : ''}
             </button>
           );
         })}
@@ -1176,7 +1177,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
           <button onClick={handlePredict} disabled={busy || !canBet} style={{ marginTop: '6px' }}>
             {busy ? '⏳ ' + status : !canBet ? '🔒 投注已关闭' : isFutureMatch ? '⏳ 预测未来比赛' : '💰 USDC 预测'}
           </button>
-          {!canBet && !busy && <div className="muted" style={{ marginTop: '6px', color: '#ff8800' }}>剩余 ≤5 条蛇时投注关闭，可选择未来比赛提前下注</div>}
+          {!canBet && !busy && <div className="muted" style={{ marginTop: '6px', color: '#ff8800' }}>比赛开始 10 秒后投注关闭，可选择未来比赛提前下注以获得50%额外积分</div>}
         </>;
       })()}
       {!busy && status && <div className="muted" style={{ marginTop: '6px' }}>{status}</div>}
@@ -1748,6 +1749,32 @@ function PointsPage() {
   );
 }
 
+// Runner Pool Display — shows total runner rewards accumulated (visible to all)
+function RunnerPoolDisplay() {
+  const [total, setTotal] = useState('0');
+  useEffect(() => {
+    const load = () => {
+      fetch('/api/runner-rewards/stats')
+        .then(r => r.json())
+        .then(d => { if (d.totalAccumulated) setTotal(d.totalAccumulated); })
+        .catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 30000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div style={{
+      padding: '4px 10px', fontSize: '0.72rem', borderRadius: '6px',
+      background: 'rgba(255,170,0,0.1)', border: '1px solid rgba(255,170,0,0.4)',
+      color: '#ffaa00', fontFamily: 'Orbitron, monospace', fontWeight: 'bold',
+      whiteSpace: 'nowrap',
+    }}>
+      Runner Pool: {parseFloat(total).toFixed(2)} USDC
+    </div>
+  );
+}
+
 // Portfolio button — shown in header next to wallet button
 function PortfolioButton({ activePage, onSwitch }: { activePage: string; onSwitch: (p: any) => void }) {
   const { isConnected } = useAccount();
@@ -1781,6 +1808,17 @@ function PortfolioPage() {
   const [botsLoading, setBotsLoading] = useState(false);
   const [claiming, setClaiming] = useState(false);
   const [claimStatus, setClaimStatus] = useState('');
+  const [runnerRewards, setRunnerRewards] = useState<{ bots: any[]; total: string }>({ bots: [], total: '0' });
+  const [claimingRunner, setClaimingRunner] = useState(false);
+  const [runnerClaimStatus, setRunnerClaimStatus] = useState('');
+
+  const loadRunnerRewards = async () => {
+    if (!address) return;
+    try {
+      const res = await fetch(`/api/runner-rewards/pending?address=${address}`);
+      if (res.ok) setRunnerRewards(await res.json());
+    } catch (_e) { /* ignore */ }
+  };
 
   const loadData = async () => {
     if (!address) { setLoading(false); return; }
@@ -1794,7 +1832,8 @@ function PortfolioPage() {
   useEffect(() => {
     setLoading(true);
     loadData();
-    const t = setInterval(loadData, 15000);
+    loadRunnerRewards();
+    const t = setInterval(() => { loadData(); loadRunnerRewards(); }, 15000);
     return () => clearInterval(t);
   }, [address]);
 
@@ -1867,6 +1906,43 @@ function PortfolioPage() {
     loadData();
   };
 
+  const handleClaimRunnerRewards = async () => {
+    if (!runnerRewards.bots.length || claimingRunner) return;
+    if (chain?.id !== baseSepolia.id) {
+      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setRunnerClaimStatus('Please switch to Base Sepolia'); return; }
+    }
+    setClaimingRunner(true);
+    setRunnerClaimStatus('Claiming runner rewards...');
+    try {
+      const botIds = runnerRewards.bots.map((b: any) => b.botId);
+      const gas = await estimateGas({
+        address: CONTRACTS.pariMutuel as `0x${string}`,
+        abi: PARI_MUTUEL_ABI,
+        functionName: 'claimRunnerRewardsBatch',
+        args: [botIds],
+        account: address as `0x${string}`,
+      });
+      await writeContractAsync({
+        address: CONTRACTS.pariMutuel as `0x${string}`,
+        abi: PARI_MUTUEL_ABI,
+        functionName: 'claimRunnerRewardsBatch',
+        args: [botIds],
+        chainId: baseSepolia.id,
+        ...(gas ? { gas } : {}),
+      });
+      setRunnerClaimStatus('Runner rewards claimed!');
+      loadRunnerRewards();
+    } catch (e: any) {
+      const msg = e?.shortMessage || e?.message || '';
+      if (msg.includes('rejected') || msg.includes('denied')) {
+        setRunnerClaimStatus('Cancelled');
+      } else {
+        setRunnerClaimStatus('Claim failed: ' + msg.slice(0, 80));
+      }
+    }
+    setClaimingRunner(false);
+  };
+
   if (!isConnected) {
     return (
       <div style={{ padding: '48px 24px', textAlign: 'center' }}>
@@ -1918,6 +1994,50 @@ function PortfolioPage() {
         })()}
         {claimStatus && (
           <div style={{ fontSize: '0.75rem', color: 'var(--neon-blue)', marginTop: 6, textAlign: 'center' }}>{claimStatus}</div>
+        )}
+      </div>
+
+      {/* Runner Rewards Banner */}
+      <div className="panel-section" style={{ marginBottom: '24px' }}>
+        {(() => {
+          const hasRunner = parseFloat(runnerRewards.total) > 0;
+          return (
+            <div className="panel-card" style={{
+              background: hasRunner ? 'rgba(255,170,0,0.08)' : 'rgba(255,255,255,0.03)',
+              border: hasRunner ? '1px solid #ffaa00' : '1px solid #2a2a4a',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '16px 20px', borderRadius: '10px',
+            }}>
+              <div>
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-dim)', marginBottom: 4 }}>Runner Rewards</div>
+                <div style={{ fontSize: '1.6rem', fontWeight: 'bold', color: hasRunner ? '#ffaa00' : '#555' }}>
+                  {runnerRewards.total} USDC
+                </div>
+                {hasRunner && (
+                  <div style={{ fontSize: '0.7rem', color: '#888', marginTop: 2 }}>
+                    {runnerRewards.bots.map((b: any) => `${b.botName}: ${b.pending}`).join(' | ')}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={handleClaimRunnerRewards}
+                disabled={claimingRunner || !hasRunner}
+                style={{
+                  padding: '10px 24px', borderRadius: '8px',
+                  background: !hasRunner ? '#222' : claimingRunner ? '#333' : '#ffaa00',
+                  color: !hasRunner ? '#555' : claimingRunner ? '#888' : '#000',
+                  border: 'none',
+                  cursor: !hasRunner || claimingRunner ? 'not-allowed' : 'pointer',
+                  fontFamily: 'Orbitron, monospace', fontSize: '0.85rem', fontWeight: 'bold',
+                }}
+              >
+                {claimingRunner ? 'Claiming...' : 'Claim Runner Rewards'}
+              </button>
+            </div>
+          );
+        })()}
+        {runnerClaimStatus && (
+          <div style={{ fontSize: '0.75rem', color: '#ffaa00', marginTop: 6, textAlign: 'center' }}>{runnerClaimStatus}</div>
         )}
       </div>
 
@@ -2664,6 +2784,7 @@ function App() {
               <button className={`tab ${activePage === 'marketplace' ? 'active' : ''}`} onClick={() => switchPage('marketplace')}>🏪 市场</button>
               <button className={`tab ${activePage === 'replay' ? 'active' : ''}`} onClick={() => switchPage('replay')}>🎬 回放</button>
               <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <RunnerPoolDisplay />
                 <PortfolioButton activePage={activePage} onSwitch={switchPage} />
                 <WalletButton />
               </div>

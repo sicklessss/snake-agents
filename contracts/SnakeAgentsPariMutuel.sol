@@ -11,10 +11,24 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
+interface IBotRegistry {
+    function getBotById(bytes32 _botId) external view returns (
+        bytes32 botId,
+        string memory botName,
+        address owner,
+        bool registered,
+        uint256 registeredAt,
+        uint256 matchesPlayed,
+        uint256 totalEarnings,
+        uint256 salePrice
+    );
+}
+
 /**
  * @title SnakeAgentsPariMutuel
  * @notice Pari-mutuel betting pool for Snake Agents (USDC version)
- * @dev 10% platform rake, 90% to bettors. Uses USDC (6 decimals) on Base Sepolia.
+ * @dev 5% platform rake + 5% runner rewards, 90% to bettors.
+ *      Uses USDC (6 decimals) on Base Sepolia.
  *      Single-bettor matches are auto-cancelled (full refund, no rake).
  *      Oracle can lock betting mid-match. Timeout safety valve for stuck matches.
  */
@@ -28,9 +42,17 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant SECOND_PLACE_SHARE = 3000; // 30%
     uint256 public constant THIRD_PLACE_SHARE = 2000;  // 20%
 
-    // Platform rake: 10% (covers platform + bot designer rewards)
-    uint256 public constant PLATFORM_RAKE = 1000;     // 10%
-    uint256 public constant TOTAL_RAKE = 1000;        // 10%
+    // Platform rake: 5% (platform only)
+    uint256 public constant PLATFORM_RAKE = 500;      // 5%
+    // Runner rewards pool: 5% (distributed to top 3 bots per match)
+    uint256 public constant RUNNER_RAKE = 500;         // 5%
+    // Total rake: 10%
+    uint256 public constant TOTAL_RAKE = 1000;         // 10%
+
+    // Runner reward distribution: 60% / 30% / 10% to 1st/2nd/3rd place bots
+    uint256 public constant RUNNER_FIRST_SHARE = 6000;  // 60%
+    uint256 public constant RUNNER_SECOND_SHARE = 3000; // 30%
+    uint256 public constant RUNNER_THIRD_SHARE = 1000;  // 10%
 
     // Timeout: if Oracle doesn't settle/cancel within 1 hour, anyone can trigger refund
     uint256 public constant MATCH_TIMEOUT = 1 hours;
@@ -38,6 +60,11 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     // ============ State Variables ============
 
     IERC20 public usdc;
+    IBotRegistry public botRegistry;
+
+    // Runner rewards tracking
+    uint256 public totalRunnerRewardsAccumulated; // lifetime total (only increases, includes claimed)
+    mapping(bytes32 => uint256) public pendingRunnerRewards; // per-bot unclaimed rewards
 
     // ============ Structs ============
 
@@ -104,6 +131,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     event OracleAuthorized(address oracle);
     event OracleRevoked(address oracle);
     event PlatformFeesWithdrawn(uint256 amount);
+    event RunnerRewardsClaimed(bytes32 indexed botId, address indexed owner, uint256 amount);
 
     // ============ Modifiers ============
 
@@ -125,8 +153,9 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
     // ============ Constructor ============
 
-    constructor(address _usdc) Ownable(msg.sender) {
+    constructor(address _usdc, address _botRegistry) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
+        botRegistry = IBotRegistry(_botRegistry);
     }
 
     // ============ Core Functions ============
@@ -214,6 +243,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @notice Settle a match. If only 1 unique bettor, auto-cancels for full refund.
+     *         Splits 10% rake into 5% platform + 5% runner rewards.
      */
     function settleMatch(
         uint256 _matchId,
@@ -244,11 +274,34 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
         uint256 totalPool = matchData.totalPool;
         uint256 platformRake = 0;
+        uint256 runnerPool = 0;
 
         if (totalPool > 0) {
-            // Platform rake: 10% (covers platform + bot designer rewards)
+            // Platform rake: 5%
             platformRake = (totalPool * PLATFORM_RAKE) / PERCENTAGE_BASE;
             accumulatedPlatformFees += platformRake;
+
+            // Runner rewards pool: 5%
+            runnerPool = (totalPool * RUNNER_RAKE) / PERCENTAGE_BASE;
+            totalRunnerRewardsAccumulated += runnerPool;
+
+            // Distribute runner pool to top bots (same proportional logic as bettor payouts)
+            uint256 totalAllocatedRunnerShare = 0;
+            for (uint i = 0; i < _winners.length; i++) {
+                uint256 s;
+                if (i == 0) s = RUNNER_FIRST_SHARE;
+                else if (i == 1) s = RUNNER_SECOND_SHARE;
+                else s = RUNNER_THIRD_SHARE;
+                totalAllocatedRunnerShare += s;
+            }
+            for (uint i = 0; i < _winners.length; i++) {
+                uint256 s;
+                if (i == 0) s = RUNNER_FIRST_SHARE;
+                else if (i == 1) s = RUNNER_SECOND_SHARE;
+                else s = RUNNER_THIRD_SHARE;
+                uint256 reward = (runnerPool * s) / totalAllocatedRunnerShare;
+                pendingRunnerRewards[_winners[i]] += reward;
+            }
 
             // Store winner pool amounts for bettor payout calculation
             uint256[] memory winnerPools = new uint256[](_winners.length);
@@ -258,7 +311,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
             matchData.winnerPools = winnerPools;
         }
 
-        emit MatchSettled(_matchId, _winners, totalPool, platformRake, 0);
+        emit MatchSettled(_matchId, _winners, totalPool, platformRake, runnerPool);
     }
 
     function cancelMatch(uint256 _matchId, string calldata _reason)
@@ -339,7 +392,53 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         emit RefundClaimed(_matchId, msg.sender, refundAmount);
     }
 
+    // ============ Runner Rewards ============
+
+    /**
+     * @notice Bot Owner claims accumulated runner rewards for a specific bot.
+     */
+    function claimRunnerRewards(bytes32 _botId) external nonReentrant {
+        uint256 amount = pendingRunnerRewards[_botId];
+        require(amount > 0, "No runner rewards");
+
+        // Verify caller is bot owner via BotRegistry
+        (, , address botOwner, , , , , ) = botRegistry.getBotById(_botId);
+        require(botOwner == msg.sender, "Not bot owner");
+
+        pendingRunnerRewards[_botId] = 0;
+        require(usdc.transfer(msg.sender, amount), "USDC transfer failed");
+
+        emit RunnerRewardsClaimed(_botId, msg.sender, amount);
+    }
+
+    /**
+     * @notice Batch claim runner rewards for multiple bots owned by caller.
+     */
+    function claimRunnerRewardsBatch(bytes32[] calldata _botIds) external nonReentrant {
+        uint256 totalAmount = 0;
+
+        for (uint i = 0; i < _botIds.length; i++) {
+            uint256 amount = pendingRunnerRewards[_botIds[i]];
+            if (amount == 0) continue;
+
+            (, , address botOwner, , , , , ) = botRegistry.getBotById(_botIds[i]);
+            require(botOwner == msg.sender, "Not bot owner");
+
+            pendingRunnerRewards[_botIds[i]] = 0;
+            totalAmount += amount;
+
+            emit RunnerRewardsClaimed(_botIds[i], msg.sender, amount);
+        }
+
+        require(totalAmount > 0, "No runner rewards");
+        require(usdc.transfer(msg.sender, totalAmount), "USDC transfer failed");
+    }
+
     // ============ View Functions ============
+
+    function getRunnerRewardStats() external view returns (uint256) {
+        return totalRunnerRewardsAccumulated;
+    }
 
     function calculateBetWinnings(uint256 _matchId, uint256 _betIndex)
         public
@@ -366,7 +465,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         }
 
         uint256 totalPool = matchData.totalPool;
-        // 90% to bettors (100% - 10% platform rake)
+        // 90% to bettors (100% - 10% total rake)
         uint256 payoutPool = (totalPool * (PERCENTAGE_BASE - TOTAL_RAKE)) / PERCENTAGE_BASE;
 
         // Calculate this place's share and total allocated shares
@@ -461,6 +560,10 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         require(usdc.transfer(owner(), amount), "Withdraw failed");
 
         emit PlatformFeesWithdrawn(amount);
+    }
+
+    function setBotRegistry(address _botRegistry) external onlyOwner {
+        botRegistry = IBotRegistry(_botRegistry);
     }
 
     function setUsdc(address _usdc) external onlyOwner {

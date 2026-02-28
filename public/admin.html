@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Snake Agents Admin</title>
-<script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -240,6 +240,17 @@ let mmSigner = null;
 // Contract ABIs for MetaMask withdraw
 const WITHDRAW_ABI_PM = ['function withdrawPlatformFees() external'];
 const WITHDRAW_ABI_MKT = ['function withdrawFees() external'];
+const WITHDRAW_ABI_REG = ['function withdrawFees() external'];
+
+// Base Sepolia chain config
+const BASE_SEPOLIA_CHAIN_ID = '0x14a34'; // 84532
+const BASE_SEPOLIA_CHAIN = {
+  chainId: BASE_SEPOLIA_CHAIN_ID,
+  chainName: 'Base Sepolia',
+  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+  rpcUrls: ['https://sepolia.base.org'],
+  blockExplorerUrls: ['https://sepolia.basescan.org']
+};
 
 // --- Auth ---
 let loginAttempts = 0;
@@ -510,10 +521,12 @@ async function refreshBalances() {
       if (c.accumulatedFees && c.accumulatedFees !== 'N/A') {
         rows.push(['Withdrawable Fees', c.accumulatedFees + ' ETH']);
       }
-      const hasFees = (key === 'pariMutuel' || key === 'botMarketplace') && c.accumulatedFees && c.accumulatedFees !== 'N/A' && parseFloat(c.accumulatedFees) > 0;
-      const withdrawBtn = hasFees && mmSigner
+      const hasAccumFees = (key === 'pariMutuel' || key === 'botMarketplace') && c.accumulatedFees && c.accumulatedFees !== 'N/A' && parseFloat(c.accumulatedFees) > 0;
+      const hasEthBalance = parseFloat(c.ethBalance) > 0;
+      const canWithdraw = key === 'botRegistry' ? hasEthBalance : hasAccumFees;
+      const withdrawBtn = canWithdraw && mmSigner
         ? `<button class="btn btn-green" style="margin-top:8px;width:100%" onclick="doWithdrawMM('${key}','${esc(c.address)}')">Withdraw via Wallet</button>`
-        : hasFees
+        : canWithdraw
         ? `<button class="btn" style="margin-top:8px;width:100%;opacity:0.5" disabled title="Connect wallet first">Connect Wallet to Withdraw</button>`
         : '';
       grid.innerHTML += balanceCard(label, c.address, rows, withdrawBtn);
@@ -542,13 +555,25 @@ async function connectMetaMask() {
   }
   try {
     await window.ethereum.request({ method: 'eth_requestAccounts' });
+    // Switch to Base Sepolia
+    try {
+      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }] });
+    } catch (switchErr) {
+      // Chain not added yet — add it
+      if (switchErr.code === 4902) {
+        await window.ethereum.request({ method: 'wallet_addEthereumChain', params: [BASE_SEPOLIA_CHAIN] });
+      } else {
+        throw switchErr;
+      }
+    }
     mmProvider = new ethers.providers.Web3Provider(window.ethereum);
     mmSigner = mmProvider.getSigner();
     const addr = await mmSigner.getAddress();
-    document.getElementById('btnConnectMM').textContent = shortAddr(addr);
+    const network = await mmProvider.getNetwork();
+    document.getElementById('btnConnectMM').textContent = shortAddr(addr) + ' (Base Sepolia)';
     document.getElementById('btnConnectMM').classList.remove('btn-purple');
     document.getElementById('btnConnectMM').classList.add('btn-green');
-    toast('Wallet connected: ' + shortAddr(addr));
+    toast('Wallet connected on Base Sepolia: ' + shortAddr(addr));
     refreshBalances();
   } catch (e) {
     toast('Wallet connection failed: ' + e.message, true);
@@ -557,22 +582,35 @@ async function connectMetaMask() {
 
 async function doWithdrawMM(contractKey, contractAddr) {
   if (!mmSigner) { toast('Connect wallet first', true); return; }
+  // Verify we're on Base Sepolia
+  const network = await mmProvider.getNetwork();
+  if (network.chainId !== 84532) {
+    toast('Please switch to Base Sepolia chain first', true);
+    try {
+      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }] });
+      mmProvider = new ethers.providers.Web3Provider(window.ethereum);
+      mmSigner = mmProvider.getSigner();
+    } catch (e) { return; }
+  }
   if (!confirm(`Withdraw fees from ${contractKey}? Only the owner wallet can execute this.`)) return;
   try {
-    let contract;
+    let contract, tx;
     if (contractKey === 'pariMutuel') {
       contract = new ethers.Contract(contractAddr, WITHDRAW_ABI_PM, mmSigner);
-      const tx = await contract.withdrawPlatformFees();
-      toast('TX submitted: ' + tx.hash);
-      await tx.wait();
-      toast('Withdraw confirmed!');
+      tx = await contract.withdrawPlatformFees();
     } else if (contractKey === 'botMarketplace') {
       contract = new ethers.Contract(contractAddr, WITHDRAW_ABI_MKT, mmSigner);
-      const tx = await contract.withdrawFees();
-      toast('TX submitted: ' + tx.hash);
-      await tx.wait();
-      toast('Withdraw confirmed!');
+      tx = await contract.withdrawFees();
+    } else if (contractKey === 'botRegistry') {
+      contract = new ethers.Contract(contractAddr, WITHDRAW_ABI_REG, mmSigner);
+      tx = await contract.withdrawFees();
+    } else {
+      toast('Unknown contract: ' + contractKey, true);
+      return;
     }
+    toast('TX submitted: ' + tx.hash);
+    await tx.wait();
+    toast('Withdraw confirmed!');
     setTimeout(refreshBalances, 2000);
   } catch (e) {
     const reason = e.reason || e.message || 'Unknown error';
