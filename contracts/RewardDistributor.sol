@@ -3,15 +3,24 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./BotRegistry.sol";
 
 /**
  * @title RewardDistributor
  * @notice Accumulate and distribute rewards to bot owners (24h settlement)
  */
-contract RewardDistributor is Ownable, ReentrancyGuard {
-    
+contract RewardDistributor is Ownable, ReentrancyGuard, Pausable {
+
     BotRegistry public botRegistry;
+
+    // Operator address (backend wallet) — can accumulate rewards but not withdraw
+    address public operator;
+
+    modifier onlyOperator() {
+        require(msg.sender == operator || msg.sender == owner(), "Not operator or owner");
+        _;
+    }
     
     // Minimum claim threshold: 0.001 ETH
     uint256 public constant MIN_CLAIM_THRESHOLD = 0.001 ether;
@@ -67,18 +76,18 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
         uint256 _amount,
         uint256 _matchId,
         uint8 _placement
-    ) external onlyOwner {
+    ) external onlyOperator whenNotPaused {
         require(_placement >= 1 && _placement <= 3, "Invalid placement");
         require(_amount > 0, "Zero amount");
-        
+
         pendingRewards[_botId] += _amount;
         totalPendingRewards += _amount;
-        
+
         rewardHistory[_botId][block.timestamp] = _amount;
-        
+
         emit RewardAccumulated(_botId, _amount, _matchId, _placement);
     }
-    
+
     /**
      * @notice Batch accumulate rewards (gas efficient)
      */
@@ -87,7 +96,7 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
         uint256[] calldata _amounts,
         uint256[] calldata _matchIds,
         uint8[] calldata _placements
-    ) external onlyOwner {
+    ) external onlyOperator whenNotPaused {
         require(
             _botIds.length == _amounts.length &&
             _amounts.length == _matchIds.length &&
@@ -109,7 +118,7 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
     /**
      * @notice Bot owner claims their own rewards (primary method)
      */
-    function claimRewards(bytes32 _botId) external nonReentrant {
+    function claimRewards(bytes32 _botId) external nonReentrant whenNotPaused {
         uint256 reward = pendingRewards[_botId];
         require(reward >= MIN_CLAIM_THRESHOLD, "Reward below threshold (0.001 ETH)");
         
@@ -129,7 +138,7 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
     /**
      * @notice Claim rewards for multiple bots at once (gas efficient)
      */
-    function claimRewardsBatch(bytes32[] calldata _botIds) external nonReentrant {
+    function claimRewardsBatch(bytes32[] calldata _botIds) external nonReentrant whenNotPaused {
         uint256 totalReward = 0;
         
         for (uint i = 0; i < _botIds.length; i++) {
@@ -155,14 +164,21 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
     }
     
     // ============ Admin Functions ============
-    
+
+    /**
+     * @notice Set operator address (backend wallet)
+     */
+    function setOperator(address _operator) external onlyOwner {
+        operator = _operator;
+    }
+
     /**
      * @notice Deposit funds for rewards
      */
     function depositFunds() external payable {
         emit FundsDeposited(msg.sender, msg.value);
     }
-    
+
     /**
      * @notice Emergency withdrawal (only if paused)
      */
@@ -193,6 +209,16 @@ contract RewardDistributor is Ownable, ReentrancyGuard {
         return balance - totalPendingRewards;
     }
     
+    // ============ Pausable ============
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     receive() external payable {
         emit FundsDeposited(msg.sender, msg.value);
     }

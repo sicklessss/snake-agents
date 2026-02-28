@@ -4,19 +4,28 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Snake Agents Admin</title>
+<script src="https://cdn.ethers.io/lib/ethers-5.7.2.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5}
 .login-screen{display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px}
 .login-screen h1{font-size:24px;color:#58a6ff}
-.login-screen input{padding:10px 16px;width:320px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px}
+.login-screen input{padding:10px 16px;width:320px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;text-align:center}
 .login-screen button{padding:10px 24px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:14px;cursor:pointer}
 .login-screen button:hover{background:#2ea043}
 .login-error{color:#f85149;font-size:13px}
+.login-step{display:flex;flex-direction:column;align-items:center;gap:12px}
 .container{max-width:1400px;margin:0 auto;padding:16px}
 header{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #21262d;margin-bottom:20px}
 header h1{font-size:20px;color:#58a6ff}
 header .actions{display:flex;gap:8px;align-items:center}
+.tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid #21262d;padding-bottom:0}
+.tab{padding:8px 16px;cursor:pointer;border:1px solid transparent;border-bottom:none;border-radius:6px 6px 0 0;color:#8b949e;font-size:13px}
+.tab:hover{color:#c9d1d9}
+.tab.active{background:#161b22;color:#58a6ff;border-color:#21262d}
+.tab-content{display:none}
+.tab-content.active{display:block}
 .btn{padding:6px 14px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#c9d1d9;cursor:pointer;font-size:13px;white-space:nowrap}
 .btn:hover{background:#30363d}
 .btn-green{background:#238636;border-color:#238636;color:#fff}
@@ -25,6 +34,8 @@ header .actions{display:flex;gap:8px;align-items:center}
 .btn-red:hover{background:#f85149}
 .btn-blue{background:#1f6feb;border-color:#1f6feb;color:#fff}
 .btn-blue:hover{background:#388bfd}
+.btn-purple{background:#8957e5;border-color:#8957e5;color:#fff}
+.btn-purple:hover{background:#a371f7}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px}
 .card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
@@ -60,6 +71,19 @@ tr:hover{background:#1c2128}
 @keyframes spin{to{transform:rotate(360deg)}}
 .referral-list{max-height:400px;overflow-y:auto}
 #lastUpdate{font-size:12px;color:#8b949e}
+/* Logs */
+.log-controls{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.log-controls select,.log-controls input{padding:6px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:13px}
+.log-controls input{flex:1;min-width:200px}
+#logPanel{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:12px;max-height:600px;overflow-y:auto;font-family:'SF Mono',Consolas,monospace;font-size:12px;line-height:1.6}
+.log-entry{padding:2px 0;border-bottom:1px solid #161b22}
+.log-debug{color:#8b949e}
+.log-info{color:#c9d1d9}
+.log-warn{color:#d29922}
+.log-error{color:#f85149}
+.log-important{color:#58a6ff;font-weight:600}
+.log-ts{color:#6e7681;margin-right:8px}
+#qrCanvas{margin:12px auto;display:block}
 </style>
 </head>
 <body>
@@ -67,8 +91,18 @@ tr:hover{background:#1c2128}
 <!-- Login Screen -->
 <div id="loginScreen" class="login-screen">
   <h1>Snake Agents Admin</h1>
-  <input type="password" id="keyInput" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')doLogin()">
-  <button onclick="doLogin()">Login</button>
+  <!-- Step 1: Admin Key -->
+  <div id="loginStep1" class="login-step">
+    <input type="password" id="keyInput" placeholder="Enter admin key" onkeydown="if(event.key==='Enter')doLoginStep1()">
+    <button onclick="doLoginStep1()">Login</button>
+  </div>
+  <!-- Step 2: TOTP -->
+  <div id="loginStep2" class="login-step hidden">
+    <div style="color:#8b949e;font-size:13px">Enter 6-digit authenticator code</div>
+    <input type="text" id="totpInput" placeholder="000000" maxlength="6" pattern="[0-9]*" inputmode="numeric" onkeydown="if(event.key==='Enter')doLoginStep2()">
+    <button onclick="doLoginStep2()">Verify</button>
+    <canvas id="qrCanvas" class="hidden"></canvas>
+  </div>
   <div id="loginError" class="login-error hidden"></div>
 </div>
 
@@ -84,6 +118,15 @@ tr:hover{background:#1c2128}
       </div>
     </header>
 
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('overview')">Overview</div>
+      <div class="tab" onclick="switchTab('logs')">Logs</div>
+    </div>
+
+    <!-- Tab: Overview -->
+    <div id="tab-overview" class="tab-content active">
+
     <!-- Overview Cards -->
     <div class="cards">
       <div class="card"><div class="label">Total Bots</div><div class="value" id="statBots">-</div></div>
@@ -97,7 +140,10 @@ tr:hover{background:#1c2128}
     <div class="section">
       <div class="section-header">
         <h2>Fund Management</h2>
-        <button class="btn btn-blue" id="btnRefreshBal" onclick="refreshBalances()">Refresh Balances</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-purple" id="btnConnectMM" onclick="connectMetaMask()">Connect Wallet</button>
+          <button class="btn btn-blue" id="btnRefreshBal" onclick="refreshBalances()">Refresh Balances</button>
+        </div>
       </div>
       <div class="section-body">
         <div class="balance-grid" id="balanceGrid">
@@ -150,63 +196,155 @@ tr:hover{background:#1c2128}
       </div>
     </div>
 
+    </div><!-- end tab-overview -->
+
+    <!-- Tab: Logs -->
+    <div id="tab-logs" class="tab-content">
+      <div class="section">
+        <div class="section-header">
+          <h2>Server Logs</h2>
+          <label style="font-size:12px;color:#8b949e"><input type="checkbox" id="logAutoRefresh" checked> Auto-refresh (5s)</label>
+        </div>
+        <div class="section-body">
+          <div class="log-controls">
+            <select id="logLevel">
+              <option value="">All Levels</option>
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warn">Warn</option>
+              <option value="error">Error</option>
+              <option value="important">Important</option>
+            </select>
+            <input type="text" id="logSearch" placeholder="Search logs...">
+            <button class="btn" onclick="fetchLogs(true)">Refresh</button>
+            <button class="btn btn-red" onclick="clearLogPanel()">Clear</button>
+          </div>
+          <div id="logPanel"></div>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
 <script>
 const API_BASE = '';
 let adminKey = sessionStorage.getItem('snake_admin_key') || '';
+let totpSession = sessionStorage.getItem('snake_totp_session') || '';
 let refreshTimer = null;
+let logTimer = null;
+let lastLogTs = 0;
+let mmProvider = null;
+let mmSigner = null;
 
-// --- Auth (with brute-force delay) ---
+// Contract ABIs for MetaMask withdraw
+const WITHDRAW_ABI_PM = ['function withdrawPlatformFees() external'];
+const WITHDRAW_ABI_MKT = ['function withdrawFees() external'];
+
+// --- Auth ---
 let loginAttempts = 0;
 let loginLocked = false;
 
-async function doLogin() {
+async function doLoginStep1() {
   if (loginLocked) return;
   const key = document.getElementById('keyInput').value.trim();
   if (!key) return;
-  const btn = document.querySelector('#loginScreen button');
-  btn.disabled = true;
-  btn.textContent = 'Verifying...';
-
   adminKey = key;
+
+  try {
+    // Check if TOTP is enabled
+    const setup = await fetch(API_BASE + '/api/admin/totp-setup', {
+      headers: { 'x-api-key': adminKey }
+    }).then(r => r.json());
+
+    if (setup.enabled) {
+      // Show TOTP step
+      document.getElementById('loginStep1').classList.add('hidden');
+      document.getElementById('loginStep2').classList.remove('hidden');
+      document.getElementById('totpInput').focus();
+
+      // Show QR code if URI available (first-time setup)
+      if (setup.uri && typeof QRCode !== 'undefined') {
+        const canvas = document.getElementById('qrCanvas');
+        canvas.classList.remove('hidden');
+        QRCode.toCanvas(canvas, setup.uri, { width: 200, margin: 2, color: { dark: '#c9d1d9', light: '#0d1117' } });
+      }
+    } else {
+      // No TOTP — direct login
+      totpSession = 'no-totp';
+      await finishLogin();
+    }
+  } catch (e) {
+    showLoginError(e);
+  }
+}
+
+async function doLoginStep2() {
+  const code = document.getElementById('totpInput').value.trim();
+  if (!code || code.length !== 6) return;
+
+  try {
+    const r = await fetch(API_BASE + '/api/admin/verify-totp', {
+      method: 'POST',
+      headers: { 'x-api-key': adminKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+
+    if (r.ok && r.session) {
+      totpSession = r.session;
+      await finishLogin();
+    } else {
+      throw new Error('Invalid code');
+    }
+  } catch (e) {
+    showLoginError(e);
+  }
+}
+
+async function finishLogin() {
   try {
     const r = await apiFetch('/api/admin/dashboard-data');
     if (r.ok) {
       loginAttempts = 0;
-      sessionStorage.setItem('snake_admin_key', key);
+      sessionStorage.setItem('snake_admin_key', adminKey);
+      sessionStorage.setItem('snake_totp_session', totpSession);
       showDashboard();
-      btn.disabled = false;
-      btn.textContent = 'Login';
       return;
     }
   } catch (e) {
-    const errEl = document.getElementById('loginError');
-    loginAttempts++;
-    adminKey = '';
-
-    if (e.message.includes('429')) {
-      errEl.textContent = 'Too many attempts. Please wait before retrying.';
-    } else {
-      const delaySec = Math.min(30, Math.pow(2, loginAttempts));
-      errEl.textContent = `Invalid admin key. Wait ${delaySec}s before retrying.`;
-      loginLocked = true;
-      setTimeout(() => { loginLocked = false; btn.disabled = false; btn.textContent = 'Login'; }, delaySec * 1000);
-    }
-    errEl.classList.remove('hidden');
+    showLoginError(e);
   }
-  btn.disabled = false;
-  btn.textContent = 'Login';
+}
+
+function showLoginError(e) {
+  const errEl = document.getElementById('loginError');
+  loginAttempts++;
+  if (e.message && e.message.includes('429')) {
+    errEl.textContent = 'Too many attempts. Please wait before retrying.';
+  } else if (e.message && e.message.includes('403')) {
+    errEl.textContent = 'TOTP verification required.';
+  } else {
+    const delaySec = Math.min(30, Math.pow(2, loginAttempts));
+    errEl.textContent = `Auth failed. Wait ${delaySec}s before retrying.`;
+    loginLocked = true;
+    setTimeout(() => { loginLocked = false; }, delaySec * 1000);
+  }
+  errEl.classList.remove('hidden');
 }
 
 function doLogout() {
   adminKey = '';
+  totpSession = '';
   sessionStorage.removeItem('snake_admin_key');
+  sessionStorage.removeItem('snake_totp_session');
   clearInterval(refreshTimer);
+  clearInterval(logTimer);
   document.getElementById('dashboard').classList.add('hidden');
   document.getElementById('loginScreen').classList.remove('hidden');
+  document.getElementById('loginStep1').classList.remove('hidden');
+  document.getElementById('loginStep2').classList.add('hidden');
   document.getElementById('keyInput').value = '';
+  document.getElementById('qrCanvas').classList.add('hidden');
 }
 
 function showDashboard() {
@@ -216,13 +354,28 @@ function showDashboard() {
   refreshTimer = setInterval(refreshDashboard, 30000);
 }
 
+// --- Tabs ---
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab[onclick*="${tab}"]`).classList.add('active');
+  document.getElementById('tab-' + tab).classList.add('active');
+  if (tab === 'logs') {
+    fetchLogs(true);
+    logTimer = setInterval(() => {
+      if (document.getElementById('logAutoRefresh').checked) fetchLogs();
+    }, 5000);
+  } else {
+    clearInterval(logTimer);
+  }
+}
+
 // --- API Helper ---
 async function apiFetch(path, opts = {}) {
-  const resp = await fetch(API_BASE + path, {
-    ...opts,
-    headers: { 'x-api-key': adminKey, 'Content-Type': 'application/json', ...(opts.headers || {}) }
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const headers = { 'x-api-key': adminKey, 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (totpSession) headers['x-totp-session'] = totpSession;
+  const resp = await fetch(API_BASE + path, { ...opts, headers });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
   return resp.json();
 }
 
@@ -242,7 +395,7 @@ async function refreshDashboard() {
     renderMatches(data.recentMatches || []);
     renderReferrals(data.referralUsers || {});
   } catch (e) {
-    if (e.message.includes('401')) { doLogout(); return; }
+    if (e.message.includes('401') || e.message.includes('403')) { doLogout(); return; }
     toast('Failed to refresh: ' + e.message, true);
   }
 }
@@ -357,8 +510,11 @@ async function refreshBalances() {
       if (c.accumulatedFees && c.accumulatedFees !== 'N/A') {
         rows.push(['Withdrawable Fees', c.accumulatedFees + ' ETH']);
       }
-      const withdrawBtn = (key === 'pariMutuel' || key === 'botMarketplace') && c.accumulatedFees && c.accumulatedFees !== 'N/A' && parseFloat(c.accumulatedFees) > 0
-        ? `<button class="btn btn-green" style="margin-top:8px;width:100%" onclick="doWithdraw('${key}')">Withdraw Fees</button>`
+      const hasFees = (key === 'pariMutuel' || key === 'botMarketplace') && c.accumulatedFees && c.accumulatedFees !== 'N/A' && parseFloat(c.accumulatedFees) > 0;
+      const withdrawBtn = hasFees && mmSigner
+        ? `<button class="btn btn-green" style="margin-top:8px;width:100%" onclick="doWithdrawMM('${key}','${esc(c.address)}')">Withdraw via Wallet</button>`
+        : hasFees
+        ? `<button class="btn" style="margin-top:8px;width:100%;opacity:0.5" disabled title="Connect wallet first">Connect Wallet to Withdraw</button>`
         : '';
       grid.innerHTML += balanceCard(label, c.address, rows, withdrawBtn);
     }
@@ -378,18 +534,85 @@ function balanceCard(title, addr, rows, extra='') {
   </div>`;
 }
 
-async function doWithdraw(contract) {
-  if (!confirm(`Withdraw fees from ${contract}?`)) return;
-  try {
-    const r = await apiFetch('/api/admin/withdraw', {
-      method: 'POST',
-      body: JSON.stringify({ contract })
-    });
-    toast('Withdraw submitted! TX: ' + (r.txHash || 'pending'));
-    setTimeout(refreshBalances, 3000);
-  } catch (e) {
-    toast('Withdraw failed: ' + e.message, true);
+// --- MetaMask Withdraw ---
+async function connectMetaMask() {
+  if (typeof window.ethereum === 'undefined') {
+    toast('MetaMask not detected', true);
+    return;
   }
+  try {
+    await window.ethereum.request({ method: 'eth_requestAccounts' });
+    mmProvider = new ethers.providers.Web3Provider(window.ethereum);
+    mmSigner = mmProvider.getSigner();
+    const addr = await mmSigner.getAddress();
+    document.getElementById('btnConnectMM').textContent = shortAddr(addr);
+    document.getElementById('btnConnectMM').classList.remove('btn-purple');
+    document.getElementById('btnConnectMM').classList.add('btn-green');
+    toast('Wallet connected: ' + shortAddr(addr));
+    refreshBalances();
+  } catch (e) {
+    toast('Wallet connection failed: ' + e.message, true);
+  }
+}
+
+async function doWithdrawMM(contractKey, contractAddr) {
+  if (!mmSigner) { toast('Connect wallet first', true); return; }
+  if (!confirm(`Withdraw fees from ${contractKey}? Only the owner wallet can execute this.`)) return;
+  try {
+    let contract;
+    if (contractKey === 'pariMutuel') {
+      contract = new ethers.Contract(contractAddr, WITHDRAW_ABI_PM, mmSigner);
+      const tx = await contract.withdrawPlatformFees();
+      toast('TX submitted: ' + tx.hash);
+      await tx.wait();
+      toast('Withdraw confirmed!');
+    } else if (contractKey === 'botMarketplace') {
+      contract = new ethers.Contract(contractAddr, WITHDRAW_ABI_MKT, mmSigner);
+      const tx = await contract.withdrawFees();
+      toast('TX submitted: ' + tx.hash);
+      await tx.wait();
+      toast('Withdraw confirmed!');
+    }
+    setTimeout(refreshBalances, 2000);
+  } catch (e) {
+    const reason = e.reason || e.message || 'Unknown error';
+    toast('Withdraw failed: ' + reason, true);
+  }
+}
+
+// --- Logs ---
+async function fetchLogs(reset) {
+  if (reset) lastLogTs = 0;
+  try {
+    const level = document.getElementById('logLevel').value;
+    const url = '/api/admin/logs?since=' + lastLogTs + (level ? '&level=' + level : '');
+    const data = await apiFetch(url);
+    if (!data.logs || data.logs.length === 0) return;
+
+    const search = (document.getElementById('logSearch').value || '').toLowerCase();
+    const panel = document.getElementById('logPanel');
+    const wasAtBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 20;
+
+    for (const entry of data.logs) {
+      if (search && !entry.msg.toLowerCase().includes(search)) continue;
+      const div = document.createElement('div');
+      div.className = 'log-entry log-' + entry.level;
+      const ts = new Date(entry.ts).toLocaleTimeString();
+      div.innerHTML = `<span class="log-ts">${ts}</span>[${entry.level.toUpperCase()}] ${esc(entry.msg)}`;
+      panel.appendChild(div);
+      lastLogTs = Math.max(lastLogTs, entry.ts);
+    }
+
+    // Auto-scroll if user was at bottom
+    if (wasAtBottom) panel.scrollTop = panel.scrollHeight;
+  } catch (e) {
+    // silent
+  }
+}
+
+function clearLogPanel() {
+  document.getElementById('logPanel').innerHTML = '';
+  lastLogTs = 0;
 }
 
 // --- Utils ---
@@ -405,7 +628,6 @@ function toast(msg, isErr) {
 
 // --- Init ---
 if (adminKey) {
-  // Try auto-login with stored key
   apiFetch('/api/admin/dashboard-data').then(data => {
     if (data.ok) showDashboard();
     else doLogout();

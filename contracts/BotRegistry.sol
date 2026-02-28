@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 interface ISnakeBotNFT {
     function mintBotNFT(address _to, bytes32 _botId, string calldata _botName) external returns (uint256);
@@ -13,7 +14,7 @@ interface ISnakeBotNFT {
  * @title BotRegistry
  * @notice Bot registration, ownership, and marketplace
  */
-contract BotRegistry is Ownable, ReentrancyGuard {
+contract BotRegistry is Ownable, ReentrancyGuard, Pausable {
     
     // ============ Constants ============
     uint256 public constant MAX_BOTS_PER_USER = 5;
@@ -109,10 +110,10 @@ contract BotRegistry is Ownable, ReentrancyGuard {
      * @param _creator Initial creator address (can be 0 for unclaimed)
      */
     function createBot(
-        bytes32 _botId, 
+        bytes32 _botId,
         string calldata _botName,
         address _creator
-    ) external onlyBackend {
+    ) external onlyBackend whenNotPaused {
         require(bots[_botId].owner == address(0), "Bot exists");
         require(bytes(_botName).length > 0 && bytes(_botName).length <= 32, "Invalid name");
         require(nameToBot[_botName] == bytes32(0), "Name taken");
@@ -148,7 +149,7 @@ contract BotRegistry is Ownable, ReentrancyGuard {
      * @param _botId Bot to register
      * @param _inviter Optional inviter address for referral (address(0) if none)
      */
-    function registerBot(bytes32 _botId, address _inviter) external payable nonReentrant botExists(_botId) {
+    function registerBot(bytes32 _botId, address _inviter) external payable nonReentrant botExists(_botId) whenNotPaused {
         require(!bots[_botId].registered, "Already registered");
         require(msg.value >= registrationFee, "Insufficient fee");
         require(_inviter != msg.sender, "Cannot invite self");
@@ -376,5 +377,15 @@ contract BotRegistry is Ownable, ReentrancyGuard {
     
     function getRegistrationFee() external view returns (uint256) {
         return registrationFee;
+    }
+
+    // ============ Pausable ============
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 }

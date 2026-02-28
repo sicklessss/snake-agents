@@ -953,7 +953,7 @@ function BotManagement() {
 }
 
 // Prediction — on-chain USDC betting via SnakeAgentsPariMutuel contract
-function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string; chainCreated?: boolean } | null; epoch: number; arenaType: 'performance' | 'competitive'; bettingOpen: boolean }) {
+function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, arenaId }: { displayMatchId: string | null; nextMatch?: { matchId: number; displayMatchId: string; chainCreated?: boolean } | null; epoch: number; arenaType: 'performance' | 'competitive'; bettingOpen: boolean; arenaId: string }) {
   const { isConnected, address, chain } = useAccount();
   const { writeContractAsync } = useWriteContract();
   const { signMessageAsync } = useSignMessage();
@@ -1145,13 +1145,14 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
     <div className="panel-card">
       <div className="panel-row"><span>选择比赛</span><span>Epoch {epoch}</span></div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px', marginBottom: '6px' }}>
-        {activeMatches.filter(m => m.gameState === 'PLAYING').map(m => {
+        {activeMatches.filter(m => m.arenaId === arenaId && (m.gameState === 'PLAYING' || ((m.gameState === 'NEXT' || m.gameState === 'FUTURE') && m.chainCreated))).map(m => {
           const isCurrent = m.displayMatchId === displayMatchId;
           const selected = targetMatch === m.displayMatchId;
+          const isFuture = m.gameState === 'NEXT' || m.gameState === 'FUTURE';
           return (
             <button key={m.displayMatchId} onClick={() => setTargetMatch(m.displayMatchId)} type="button"
-              style={{ fontSize: '0.7rem', padding: '3px 6px', background: selected ? 'var(--neon-green)' : 'transparent', color: selected ? '#000' : isCurrent ? 'var(--neon-green)' : '#aaa', border: `1px solid ${isCurrent ? 'var(--neon-green)' : m.bettingOpen ? '#555' : '#333'}`, opacity: m.bettingOpen ? 1 : 0.5 }}>
-              {m.displayMatchId}{isCurrent ? '★' : ''}{!m.bettingOpen ? '🔒' : ''}
+              style={{ fontSize: '0.7rem', padding: '3px 6px', background: selected ? 'var(--neon-green)' : 'transparent', color: selected ? '#000' : isCurrent ? 'var(--neon-green)' : isFuture ? '#66aaff' : '#aaa', border: `1px solid ${isCurrent ? 'var(--neon-green)' : isFuture ? '#3366aa' : m.bettingOpen ? '#555' : '#333'}`, opacity: m.bettingOpen ? 1 : 0.5 }}>
+              {m.displayMatchId}{isCurrent ? '★' : ''}{isFuture ? '⏳' : ''}{!m.bettingOpen ? '🔒' : ''}
             </button>
           );
         })}
@@ -1167,10 +1168,17 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen }
           </button>
         ))}
       </div>
-      <button onClick={handlePredict} disabled={busy || !bettingOpen} style={{ marginTop: '6px' }}>
-        {busy ? '⏳ ' + status : !bettingOpen ? '🔒 投注已关闭' : '💰 USDC 预测'}
-      </button>
-      {!bettingOpen && !busy && <div className="muted" style={{ marginTop: '6px', color: '#ff8800' }}>剩余 ≤5 条蛇时投注关闭，请等待下一场</div>}
+      {(() => {
+        const selectedMatch = activeMatches.find(m => m.displayMatchId === targetMatch);
+        const isFutureMatch = selectedMatch && (selectedMatch.gameState === 'NEXT' || selectedMatch.gameState === 'FUTURE');
+        const canBet = bettingOpen || (isFutureMatch && selectedMatch.chainCreated);
+        return <>
+          <button onClick={handlePredict} disabled={busy || !canBet} style={{ marginTop: '6px' }}>
+            {busy ? '⏳ ' + status : !canBet ? '🔒 投注已关闭' : isFutureMatch ? '⏳ 预测未来比赛' : '💰 USDC 预测'}
+          </button>
+          {!canBet && !busy && <div className="muted" style={{ marginTop: '6px', color: '#ff8800' }}>剩余 ≤5 条蛇时投注关闭，可选择未来比赛提前下注</div>}
+        </>;
+      })()}
       {!busy && status && <div className="muted" style={{ marginTop: '6px' }}>{status}</div>}
     </div>
   );
@@ -2725,7 +2733,7 @@ function App() {
                   )}
                   <div className="panel-section">
                     <h3>🔮 Prediction</h3>
-                    <Prediction displayMatchId={displayMatchId} nextMatch={nextMatch} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} bettingOpen={bettingOpen} />
+                    <Prediction displayMatchId={displayMatchId} nextMatch={nextMatch} epoch={epoch} arenaType={activePage as 'performance' | 'competitive'} bettingOpen={bettingOpen} arenaId={isCompetitive ? 'competitive-1' : `performance-${displayMatchId ? displayMatchId.charAt(0) : 'A'}`} />
                   </div>
                 </aside>
 

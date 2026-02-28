@@ -13,6 +13,7 @@ import fs from "fs";
 
 const RPC_URL = "https://sepolia.base.org";
 const USDC_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+const OWNER_ADDRESS = process.env.OWNER_ADDRESS || "0x335e151514e96cbd1a79b44c8fb7937abe333ba3";
 
 const BACKEND_KEY = process.env.BACKEND_PRIVATE_KEY;
 if (!BACKEND_KEY) {
@@ -106,6 +107,12 @@ async function main() {
   await tx5.wait();
   console.log("  done");
 
+  // RewardDistributor.setOperator(backend wallet)
+  console.log("RewardDistributor.setOperator...");
+  const tx5b = await reward.contract.setOperator(wallet.address, { nonce: nonce++, gasLimit: 100_000 });
+  await tx5b.wait();
+  console.log("  done");
+
   // Fund ReferralRewards with 0.01 ETH
   console.log("Funding ReferralRewards with 0.01 ETH...");
   const tx6 = await wallet.sendTransaction({
@@ -116,6 +123,41 @@ async function main() {
   });
   await tx6.wait();
   console.log("  done");
+
+  // --- Transfer ownership to OWNER_ADDRESS ---
+  if (OWNER_ADDRESS.toLowerCase() !== wallet.address.toLowerCase()) {
+    console.log(`\n--- Transferring ownership to ${OWNER_ADDRESS} ---`);
+
+    console.log("BotRegistry.transferOwnership...");
+    const txO1 = await registry.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO1.wait();
+    console.log("  done");
+
+    console.log("SnakeBotNFT.transferOwnership...");
+    const txO2 = await nft.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO2.wait();
+    console.log("  done");
+
+    console.log("RewardDistributor.transferOwnership...");
+    const txO3 = await reward.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO3.wait();
+    console.log("  done");
+
+    console.log("SnakeAgentsPariMutuel.transferOwnership...");
+    const txO4 = await pari.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO4.wait();
+    console.log("  done");
+
+    console.log("ReferralRewards.transferOwnership...");
+    const txO5 = await referral.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO5.wait();
+    console.log("  done");
+
+    console.log("BotMarketplace.transferOwnership...");
+    const txO6 = await market.contract.transferOwnership(OWNER_ADDRESS, { nonce: nonce++, gasLimit: 100_000 });
+    await txO6.wait();
+    console.log("  done");
+  }
 
   // --- Save deployment info ---
   const deployment = {

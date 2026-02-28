@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
@@ -13,7 +14,7 @@ import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
  *         Buyer pays   → NFT transferred to buyer, ETH to seller (minus fee).
  *         Seller cancels → NFT returned.
  */
-contract BotMarketplace is Ownable, ReentrancyGuard, IERC721Receiver {
+contract BotMarketplace is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     IERC721 public nftContract;
     uint256 public feePercent = 250; // 2.5% in basis points
     uint256 public accumulatedFees;
@@ -44,7 +45,7 @@ contract BotMarketplace is Ownable, ReentrancyGuard, IERC721Receiver {
      * @notice List an NFT for sale. Caller must have approved this contract first.
      *         NFT is transferred into escrow (this contract).
      */
-    function list(uint256 tokenId, uint256 price) external nonReentrant {
+    function list(uint256 tokenId, uint256 price) external nonReentrant whenNotPaused {
         require(price > 0, "Price must be > 0");
         require(nftContract.ownerOf(tokenId) == msg.sender, "Not NFT owner");
 
@@ -61,7 +62,7 @@ contract BotMarketplace is Ownable, ReentrancyGuard, IERC721Receiver {
     /**
      * @notice Buy a listed NFT. Sends ETH to seller minus platform fee.
      */
-    function buy(uint256 tokenId) external payable nonReentrant {
+    function buy(uint256 tokenId) external payable nonReentrant whenNotPaused {
         Listing memory item = listings[tokenId];
         require(item.price > 0, "Not listed");
         require(msg.value == item.price, "Payment must equal price");
@@ -137,6 +138,16 @@ contract BotMarketplace is Ownable, ReentrancyGuard, IERC721Receiver {
         accumulatedFees = 0;
         (bool ok, ) = payable(owner()).call{value: amount}("");
         require(ok, "Withdraw failed");
+    }
+
+    // ============ Pausable ============
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // --- Internal ---

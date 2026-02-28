@@ -22,13 +22,48 @@ const crypto = require('crypto');
 // --- Logging Config (must be early, used throughout) ---
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // 'debug' | 'info' | 'warn' | 'error'
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+// Log ring buffer for admin dashboard (max 2000 entries)
+const LOG_BUFFER_MAX = 2000;
+const logBuffer = [];
+function pushLog(level, args) {
+    const entry = { ts: Date.now(), level, msg: args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') };
+    logBuffer.push(entry);
+    if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
+    // Logtail integration (lazy init below)
+    if (_logtail) { try { _logtail[level === 'important' ? 'info' : level](entry.msg); } catch (e) {} }
+}
+
+// Logtail (Better Stack) integration — only if LOGTAIL_TOKEN is set
+let _logtail = null;
+if (process.env.LOGTAIL_TOKEN) {
+    try {
+        const { Logtail } = require('@logtail/node');
+        _logtail = new Logtail(process.env.LOGTAIL_TOKEN);
+        console.log('[Logtail] Connected');
+    } catch (e) { console.warn('[Logtail] Failed to init:', e.message); }
+}
+
 const log = {
-    debug: (...args) => LOG_LEVELS[LOG_LEVEL] <= 0 && console.log('[DEBUG]', ...args),
-    info: (...args) => LOG_LEVELS[LOG_LEVEL] <= 1 && console.log('[INFO]', ...args),
-    warn: (...args) => LOG_LEVELS[LOG_LEVEL] <= 2 && console.warn('[WARN]', ...args),
-    error: (...args) => LOG_LEVELS[LOG_LEVEL] <= 3 && console.error('[ERROR]', ...args),
-    important: (...args) => console.log('🔔', ...args), // Always show important events
+    debug: (...args) => { if (LOG_LEVELS[LOG_LEVEL] <= 0) { console.log('[DEBUG]', ...args); pushLog('debug', args); } },
+    info: (...args) => { if (LOG_LEVELS[LOG_LEVEL] <= 1) { console.log('[INFO]', ...args); pushLog('info', args); } },
+    warn: (...args) => { if (LOG_LEVELS[LOG_LEVEL] <= 2) { console.warn('[WARN]', ...args); pushLog('warn', args); } },
+    error: (...args) => { if (LOG_LEVELS[LOG_LEVEL] <= 3) { console.error('[ERROR]', ...args); pushLog('error', args); } },
+    important: (...args) => { console.log('🔔', ...args); pushLog('important', args); },
 };
+
+// --- Telegram Alerts ---
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
+async function sendTelegramAlert(message) {
+    if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+    try {
+        const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+        const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: `🐍 Snake Agents\n${message}`, parse_mode: 'HTML' });
+        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        if (!resp.ok) log.warn('[Telegram] Send failed:', resp.status);
+    } catch (e) { /* silent */ }
+}
 
 // Generate a short random ID (cryptographically secure)
 function randomId(len = 5) {
@@ -527,6 +562,19 @@ function rateLimit({ windowMs, max }) {
     };
 }
 
+// --- TOTP 2FA ---
+const ADMIN_TOTP_SECRET = process.env.ADMIN_TOTP_SECRET || null; // 32-char base32 secret
+const _totpSessions = new Map(); // token -> { expires }
+const TOTP_SESSION_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Cleanup expired TOTP sessions every hour
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, data] of _totpSessions.entries()) {
+        if (data.expires < now) _totpSessions.delete(token);
+    }
+}, 3600_000);
+
 // Admin auth with brute-force protection (exponential backoff per IP)
 const _adminFailures = new Map(); // ip -> { count, lockUntil }
 setInterval(() => { // cleanup every 10 minutes
@@ -559,6 +607,19 @@ function requireAdminKey(req, res, next) {
         return res.status(401).json({ error: 'unauthorized' });
     }
 
+    // If TOTP is configured, also require a valid TOTP session
+    if (ADMIN_TOTP_SECRET) {
+        const sessionToken = req.header('x-totp-session');
+        if (!sessionToken || !_totpSessions.has(sessionToken)) {
+            return res.status(403).json({ error: 'totp_required' });
+        }
+        const session = _totpSessions.get(sessionToken);
+        if (session.expires < Date.now()) {
+            _totpSessions.delete(sessionToken);
+            return res.status(403).json({ error: 'totp_expired' });
+        }
+    }
+
     // Success: reset failures
     _adminFailures.delete(ip);
     next();
@@ -572,6 +633,17 @@ function requireUploadKey(req, res, next) {
     }
     next();
 }
+
+// --- CORS ---
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || null; // e.g. 'https://snakeagents.com'
+app.use((req, res, next) => {
+    const origin = ALLOWED_ORIGIN || '*';
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-totp-session');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
 
 app.use((req, res, next) => {
     res.header('Cache-Control', 'private, no-cache, no-store, must-revalidate');
@@ -639,17 +711,75 @@ function getCurrentEpoch() {
     return Math.max(1, Math.floor(diffMs / (24 * 60 * 60 * 1000)) + 1);
 }
 
-// --- Global History ---
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+// --- Global History (monthly split) ---
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json'); // legacy
+function historyMonthFile(ym) { return path.join(DATA_DIR, `history-${ym}.json`); }
+function currentMonth() { return new Date().toISOString().slice(0, 7); } // '2026-02'
+
 let matchHistory = [];
 let matchNumber = 0;
+
+// Load monthly history files (current + previous month) into memory
+function loadMonthlyHistory() {
+    const months = [];
+    const cur = currentMonth();
+    months.push(cur);
+    // Previous month
+    const d = new Date(cur + '-01');
+    d.setMonth(d.getMonth() - 1);
+    months.push(d.toISOString().slice(0, 7));
+
+    const loaded = [];
+    for (const ym of months) {
+        const f = historyMonthFile(ym);
+        if (fs.existsSync(f)) {
+            try {
+                const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+                loaded.push(...data);
+            } catch (e) { log.warn(`[History] Failed to load ${ym}:`, e.message); }
+        }
+    }
+    return loaded;
+}
+
+// Migrate legacy history.json to monthly files (one-time)
 if (fs.existsSync(HISTORY_FILE)) {
     try {
-        matchHistory = JSON.parse(fs.readFileSync(HISTORY_FILE));
-        if (matchHistory.length > 0 && matchHistory[0].matchId) {
-            matchNumber = matchHistory[0].matchId + 1;
+        const legacy = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+        if (Array.isArray(legacy) && legacy.length > 0) {
+            log.info(`[History] Migrating ${legacy.length} entries from history.json to monthly files...`);
+            const byMonth = {};
+            for (const entry of legacy) {
+                const ym = entry.timestamp ? entry.timestamp.slice(0, 7) : currentMonth();
+                if (!byMonth[ym]) byMonth[ym] = [];
+                byMonth[ym].push(entry);
+            }
+            for (const [ym, entries] of Object.entries(byMonth)) {
+                const f = historyMonthFile(ym);
+                // Merge with existing monthly file if any
+                let existing = [];
+                if (fs.existsSync(f)) {
+                    try { existing = JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) {}
+                }
+                const existingIds = new Set(existing.map(e => e.matchId));
+                const merged = [...existing, ...entries.filter(e => !existingIds.has(e.matchId))];
+                merged.sort((a, b) => (b.matchId || 0) - (a.matchId || 0));
+                fs.writeFileSync(f, JSON.stringify(merged));
+                log.info(`[History] Migrated ${entries.length} entries to ${ym}`);
+            }
+            // Rename legacy file to .bak
+            fs.renameSync(HISTORY_FILE, HISTORY_FILE + '.bak');
+            log.important('[History] Migration complete, legacy file renamed to history.json.bak');
         }
-    } catch (e) { log.warn('[History] Failed to load:', e.message); }
+    } catch (e) { log.warn('[History] Migration failed:', e.message); }
+}
+
+// Load into memory
+matchHistory = loadMonthlyHistory();
+matchHistory.sort((a, b) => (b.matchId || 0) - (a.matchId || 0));
+if (matchHistory.length > 5000) matchHistory = matchHistory.slice(0, 5000);
+if (matchHistory.length > 0 && matchHistory[0].matchId) {
+    matchNumber = matchHistory[0].matchId + 1;
 }
 
 // --- Aggregated Leaderboard Stats (never loses data) ---
@@ -790,6 +920,9 @@ function enqueueTxAsync(label, fn) {
         if (!_txRunning) _drainTxQueue();
     });
 }
+const MAX_GAS_GWEI = BigInt(process.env.MAX_GAS_GWEI || '50');
+let _txConsecutiveFailures = 0;
+
 async function _drainTxQueue() {
     _txRunning = true;
     try {
@@ -801,13 +934,24 @@ async function _drainTxQueue() {
                 if (backendWallet) {
                     const pendingNonce = await backendWallet.provider.getTransactionCount(backendWallet.address, 'pending');
                     const feeData = await backendWallet.provider.getFeeData();
+                    const maxFee = (feeData.maxFeePerGas || ethers.parseUnits('10', 'gwei')) * 2n;
+                    const maxGasLimit = ethers.parseUnits(String(MAX_GAS_GWEI), 'gwei');
+
+                    // Gas price cap — skip TX if network gas is too high
+                    if (maxFee > maxGasLimit) {
+                        log.warn(`[TxQueue] Gas too high for "${label}": ${ethers.formatUnits(maxFee, 'gwei')} gwei > cap ${MAX_GAS_GWEI} gwei — skipping`);
+                        if (reject) reject(new Error(`Gas price ${ethers.formatUnits(maxFee, 'gwei')} gwei exceeds cap ${MAX_GAS_GWEI} gwei`));
+                        continue;
+                    }
+
                     overrides = {
                         nonce: pendingNonce,
-                        maxFeePerGas: (feeData.maxFeePerGas || ethers.parseUnits('10', 'gwei')) * 2n,
+                        maxFeePerGas: maxFee,
                         maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas || ethers.parseUnits('2', 'gwei')) * 2n,
                     };
                 }
                 const result = await fn(overrides);
+                _txConsecutiveFailures = 0;
                 if (resolve) resolve(result);
             } catch (e) {
                 const attempt = retries || 0;
@@ -819,12 +963,15 @@ async function _drainTxQueue() {
                 const isRetryable = (label.startsWith('createMatch') || label.startsWith('settleMatch')) && !isHopeless;
                 if (alreadyDone) {
                     log.info(`[TxQueue] ${label} already done on-chain, treating as success`);
+                    _txConsecutiveFailures = 0;
                     if (resolve) resolve(null);
                 } else if (isRetryable && attempt < 3) {
+                    _txConsecutiveFailures++;
                     log.warn(`[TxQueue] ${label} failed (attempt ${attempt + 1}/3), will retry: ${reason}`);
                     // Push to BACK of queue (not unshift!) so other TXs can process
                     _txQueue.push({ label, fn, resolve, reject, retries: attempt + 1 });
                 } else {
+                    _txConsecutiveFailures++;
                     log.warn(`[TxQueue] ${label} failed${isHopeless ? ' (hopeless, skipped)' : isRetryable ? ' (gave up after 3 attempts)' : ''}: ${reason}`);
                     if (reject) reject(e);
                 }
@@ -854,20 +1001,33 @@ setInterval(checkDailyReset, 60_000);
 
 function saveHistory(arenaId, winnerName, score, winnerId, participants) {
     const ep = getCurrentEpoch();
-    matchHistory.unshift({
+    const ts = new Date().toISOString();
+    const entry = {
         matchId: nextMatchId(),
         arenaId,
         epoch: ep,
-        timestamp: new Date().toISOString(),
+        timestamp: ts,
         winner: winnerName,
         winnerId: winnerId || null,
         score: score,
         participants: participants || [],
-    });
-    // Keep last 5000 recent matches (raw data for replays/debugging; leaderboard uses lbStats)
+    };
+    matchHistory.unshift(entry);
+    // Keep last 5000 recent matches in memory
     if (matchHistory.length > 5000) matchHistory = matchHistory.slice(0, 5000);
-    try { atomicWriteFile(HISTORY_FILE, JSON.stringify(matchHistory)); }
-    catch (e) { log.error('[History] Failed to save:', e.message); }
+
+    // Persist to monthly file
+    const ym = ts.slice(0, 7);
+    const monthFile = historyMonthFile(ym);
+    try {
+        let monthData = [];
+        if (fs.existsSync(monthFile)) {
+            try { monthData = JSON.parse(fs.readFileSync(monthFile, 'utf8')); } catch (e) {}
+        }
+        monthData.unshift(entry);
+        atomicWriteFile(monthFile, JSON.stringify(monthData));
+    } catch (e) { log.error('[History] Failed to save monthly:', e.message); }
+
     // Record win in aggregated stats (permanent, never truncated)
     recordWin(arenaId, ep, winnerName);
 }
@@ -1156,6 +1316,7 @@ class GameRoom {
         this.displayMatchId = getNextDisplayId(type, letter);
         registerDisplayId(this.displayMatchId, this.currentMatchId);
         this.nextMatch = null; // { matchId, displayMatchId }
+        this.futureMatches = []; // pre-created matches beyond nextMatch
         this.victoryPauseTimer = 0;
         this.lastSurvivorForVictory = null;
         this.replayFrames = []; // Record frames for replay
@@ -1938,7 +2099,6 @@ class GameRoom {
         if (this.nextMatch) {
             this.currentMatchId = this.nextMatch.matchId;
             this.displayMatchId = this.nextMatch.displayMatchId;
-            this.nextMatch = null;
             log.important(`[Room ${this.id}] Using pre-created match #${this.currentMatchId} (${this.displayMatchId})`);
         } else {
             // Fallback: create immediately
@@ -1955,6 +2115,13 @@ class GameRoom {
                     log.important(`[Blockchain] createMatch #${onChainMatchId} (startTime=${startTime}) confirmed`);
                 });
             }
+        }
+        // Promote: shift futureMatches[0] → nextMatch
+        if (this.futureMatches.length > 0) {
+            this.nextMatch = this.futureMatches.shift();
+            log.important(`[Room ${this.id}] Promoted futureMatch → nextMatch #${this.nextMatch.matchId} (${this.nextMatch.displayMatchId}), ${this.futureMatches.length} remaining in queue`);
+        } else {
+            this.nextMatch = null;
         }
         this.lastSurvivorForVictory = null;
         this.matchTimeLeft = MATCH_DURATION;
@@ -2050,25 +2217,39 @@ class GameRoom {
         this.matchTimeLeft = MATCH_DURATION;
         this.sendEvent('match_start', { matchId: this.currentMatchId, arenaId: this.id, arenaType: this.type });
 
-        // Pre-create next match (so users can bet on it during PLAYING)
-        const nextMid = nextMatchId();
-        const nextDispId = getNextDisplayId(this.type, this.letter);
-        registerDisplayId(nextDispId, nextMid);
-        this.nextMatch = { matchId: nextMid, displayMatchId: nextDispId, chainCreated: false };
-        log.important(`[Room ${this.id}] Pre-created next match #${nextMid} (${nextDispId})`);
+        // Pre-create future matches so users can bet ahead
+        // Maintain: nextMatch + up to 2 in futureMatches = 3 total pre-created
+        const TARGET_FUTURE = 3;
+        const alreadyHave = (this.nextMatch ? 1 : 0) + this.futureMatches.length;
+        const toCreate = TARGET_FUTURE - alreadyHave;
 
-        if (pariMutuelContract) {
-            const mid = nextMid;
-            const entry = this.nextMatch;
-            // Calculate startTime NOW (not in the callback) to avoid queue delay skewing it
-            // Next match starts after: current matchTimeLeft + GAMEOVER(5s) + COUNTDOWN(5s) ≈ +10s buffer
-            const startTime = Math.floor(Date.now() / 1000) + this.matchTimeLeft + 10;
-            enqueueTxPriority(`createMatch ${mid} (next)`, async (overrides) => {
-                const tx = await pariMutuelContract.createMatch(mid, startTime, overrides);
-                await tx.wait();
-                entry.chainCreated = true;
-                log.important(`[Blockchain] createMatch #${mid} (next, startTime=${startTime}) confirmed`);
-            });
+        for (let i = 0; i < toCreate; i++) {
+            const mid = nextMatchId();
+            const dispId = getNextDisplayId(this.type, this.letter);
+            registerDisplayId(dispId, mid);
+            const entry = { matchId: mid, displayMatchId: dispId, chainCreated: false };
+
+            if (!this.nextMatch) {
+                this.nextMatch = entry;
+            } else {
+                this.futureMatches.push(entry);
+            }
+            log.important(`[Room ${this.id}] Pre-created future match #${mid} (${dispId}), slot ${i + 1}/${toCreate}`);
+
+            if (pariMutuelContract) {
+                const matchIdForTx = mid;
+                const entryRef = entry;
+                // Each future match starts ~(MATCH_DURATION + 10s) apart
+                const matchCycleSec = MATCH_DURATION + 10; // playing + gameover + countdown
+                const offset = (alreadyHave + i + 1) * matchCycleSec;
+                const startTime = Math.floor(Date.now() / 1000) + offset;
+                enqueueTxPriority(`createMatch ${matchIdForTx} (future)`, async (overrides) => {
+                    const tx = await pariMutuelContract.createMatch(matchIdForTx, startTime, overrides);
+                    await tx.wait();
+                    entryRef.chainCreated = true;
+                    log.important(`[Blockchain] createMatch #${matchIdForTx} (future, startTime=${startTime}) confirmed`);
+                });
+            }
         }
     }
 
@@ -2129,6 +2310,11 @@ class GameRoom {
                 displayMatchId: this.nextMatch.displayMatchId,
                 chainCreated: this.nextMatch.chainCreated || false,
             } : null,
+            futureMatches: this.futureMatches.map(m => ({
+                matchId: m.matchId,
+                displayMatchId: m.displayMatchId,
+                chainCreated: m.chainCreated || false,
+            })),
             epoch: getCurrentEpoch(),
             victoryPause: this.victoryPauseTimer > 0,
             victoryPauseTime: Math.ceil(this.victoryPauseTimer / 8),
@@ -2640,7 +2826,24 @@ function assignRoomForJoin(data) {
 }
 
 // --- WebSocket ---
+const MAX_WS_PER_IP = parseInt(process.env.MAX_WS_PER_IP) || 10;
+const _wsIpCount = new Map(); // ip -> count
+
 wss.on('connection', (ws, req) => {
+    // Per-IP connection limit
+    const wsIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const currentCount = _wsIpCount.get(wsIp) || 0;
+    if (currentCount >= MAX_WS_PER_IP) {
+        log.warn(`[WS] Rejected connection from ${wsIp}: limit ${MAX_WS_PER_IP} reached`);
+        ws.close(1008, 'Too many connections');
+        return;
+    }
+    _wsIpCount.set(wsIp, currentCount + 1);
+    ws.on('close', () => {
+        const c = (_wsIpCount.get(wsIp) || 1) - 1;
+        if (c <= 0) _wsIpCount.delete(wsIp); else _wsIpCount.set(wsIp, c);
+    });
+
     let playerId = null;
     let room = null;
     let msgCount = 0;
@@ -3210,6 +3413,20 @@ app.get('/api/matches/active', (req, res) => {
                 chainCreated: room.nextMatch.chainCreated || false,
             });
         }
+        // Also include futureMatches (pre-created matches beyond nextMatch)
+        for (const fm of room.futureMatches) {
+            matches.push({
+                displayMatchId: fm.displayMatchId,
+                matchId: fm.matchId,
+                arenaId: room.id,
+                type: room.type,
+                gameState: 'FUTURE',
+                timeLeft: null,
+                players: 0,
+                bettingOpen: fm.chainCreated || false,
+                chainCreated: fm.chainCreated || false,
+            });
+        }
     }
     res.json(matches);
 });
@@ -3365,7 +3582,15 @@ app.post('/api/competitive/enter', async (req, res) => {
     res.json({ ok: true, displayMatchId, botId, message: 'Entry confirmed for ' + displayMatchId });
 });
 
-app.post("/api/admin/reset-leaderboard", requireAdminKey, (req, res) => {    matchHistory = [];    matchNumber = 0;    fs.writeFileSync(HISTORY_FILE, "[]");    log.important("[Admin] Leaderboard reset");    res.json({ ok: true, message: "Leaderboard reset" });});
+app.post("/api/admin/reset-leaderboard", requireAdminKey, (req, res) => {
+    matchHistory = [];
+    matchNumber = 0;
+    // Clear current month file
+    const f = historyMonthFile(currentMonth());
+    try { fs.writeFileSync(f, "[]"); } catch (e) {}
+    log.important("[Admin] Leaderboard reset");
+    res.json({ ok: true, message: "Leaderboard reset" });
+});
 
 // Admin: create bot on-chain for an existing local bot that missed the createBot tx
 app.post('/api/admin/create-on-chain', requireAdminKey, async (req, res) => {
@@ -4224,7 +4449,20 @@ app.get('/api/replay/:matchId', (req, res) => {
     });
 });
 
-app.get('/history', (req, res) => res.json(matchHistory));
+app.get('/history', (req, res) => {
+    const month = req.query.month; // e.g. '2026-02'
+    if (month && /^\d{4}-\d{2}$/.test(month)) {
+        const f = historyMonthFile(month);
+        if (fs.existsSync(f)) {
+            try {
+                const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+                return res.json(data);
+            } catch (e) { return res.json([]); }
+        }
+        return res.json([]);
+    }
+    res.json(matchHistory);
+});
 
 // --- NEW: Blockchain Integration APIs ---
 
@@ -4614,6 +4852,57 @@ app.get('/api/admin/referral-stats', requireAdminKey, (req, res) => {
 
 // --- Admin Dashboard APIs ---
 
+// TOTP setup — returns otpauth URI for QR code
+app.get('/api/admin/totp-setup', (req, res) => {
+    // Require admin key only (no TOTP yet since they're setting it up)
+    if (!ADMIN_KEY) return res.status(503).json({ error: 'admin_key_not_configured' });
+    const key = req.header('x-api-key');
+    if (!key || key.length !== ADMIN_KEY.length || !require('crypto').timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_KEY))) {
+        return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (!ADMIN_TOTP_SECRET) return res.json({ enabled: false });
+    try {
+        const { TOTP } = require('otpauth');
+        const totp = new TOTP({ issuer: 'SnakeAgents', label: 'Admin', algorithm: 'SHA1', digits: 6, period: 30, secret: ADMIN_TOTP_SECRET });
+        res.json({ enabled: true, uri: totp.toString() });
+    } catch (e) {
+        res.status(500).json({ error: 'totp_setup_failed', message: e.message });
+    }
+});
+
+// TOTP verify — validates 6-digit code, returns session token
+app.post('/api/admin/verify-totp', express.json(), (req, res) => {
+    if (!ADMIN_KEY) return res.status(503).json({ error: 'admin_key_not_configured' });
+    const key = req.header('x-api-key');
+    if (!key || key.length !== ADMIN_KEY.length || !require('crypto').timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_KEY))) {
+        return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (!ADMIN_TOTP_SECRET) return res.json({ ok: true, session: 'no-totp' });
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string') return res.status(400).json({ error: 'missing_code' });
+    try {
+        const { TOTP } = require('otpauth');
+        const totp = new TOTP({ issuer: 'SnakeAgents', label: 'Admin', algorithm: 'SHA1', digits: 6, period: 30, secret: ADMIN_TOTP_SECRET });
+        const delta = totp.validate({ token: code.trim(), window: 1 });
+        if (delta === null) return res.status(401).json({ error: 'invalid_code' });
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        _totpSessions.set(sessionToken, { expires: Date.now() + TOTP_SESSION_TTL });
+        log.info('[Admin] TOTP verified, session created');
+        res.json({ ok: true, session: sessionToken });
+    } catch (e) {
+        res.status(500).json({ error: 'totp_verify_failed', message: e.message });
+    }
+});
+
+// Admin logs endpoint — ring buffer viewer
+app.get('/api/admin/logs', requireAdminKey, (req, res) => {
+    const since = parseInt(req.query.since) || 0;
+    const level = req.query.level || null;
+    let entries = logBuffer.filter(e => e.ts > since);
+    if (level) entries = entries.filter(e => e.level === level);
+    res.json({ ok: true, logs: entries.slice(-500) }); // max 500 per request
+});
+
 // Dashboard: all-in-one data endpoint
 app.get('/api/admin/dashboard-data', requireAdminKey, (req, res) => {
     try {
@@ -4745,41 +5034,7 @@ app.get('/api/admin/balances', requireAdminKey, async (req, res) => {
     }
 });
 
-// Dashboard: withdraw fees from contracts
-app.post('/api/admin/withdraw', requireAdminKey, async (req, res) => {
-    const { contract } = req.body || {};
-    if (!contract) return res.status(400).json({ error: 'missing_contract' });
-
-    const validContracts = ['pariMutuel', 'botMarketplace'];
-    if (!validContracts.includes(contract)) {
-        return res.status(400).json({ error: 'invalid_contract', valid: validContracts });
-    }
-
-    try {
-        let txHash;
-        if (contract === 'pariMutuel') {
-            if (!pariMutuelContract) return res.status(503).json({ error: 'contract_not_ready' });
-            txHash = await enqueueTxAsync(`admin withdrawPlatformFees (pariMutuel)`, async (overrides) => {
-                const tx = await pariMutuelContract.withdrawPlatformFees(overrides);
-                const receipt = await tx.wait();
-                log.important(`[Admin] withdrawPlatformFees (pariMutuel) confirmed: ${receipt.hash}`);
-                return receipt.hash;
-            });
-        } else if (contract === 'botMarketplace') {
-            if (!botMarketplaceContract) return res.status(503).json({ error: 'contract_not_ready' });
-            txHash = await enqueueTxAsync(`admin withdrawFees (marketplace)`, async (overrides) => {
-                const tx = await botMarketplaceContract.withdrawFees(overrides);
-                const receipt = await tx.wait();
-                log.important(`[Admin] withdrawFees (marketplace) confirmed: ${receipt.hash}`);
-                return receipt.hash;
-            });
-        }
-        res.json({ ok: true, contract, txHash });
-    } catch (e) {
-        log.error(`[Admin] withdraw ${contract} failed:`, e.message);
-        res.status(500).json({ error: 'withdraw_failed', message: e.message });
-    }
-});
+// NOTE: /api/admin/withdraw removed — withdrawals now handled via MetaMask in admin.html (owner wallet directly calls contract)
 
 // --- Event loop lag monitor ---
 let _elLastTick = Date.now();
@@ -4794,6 +5049,7 @@ const PORT = process.env.PORT || 3000;
 const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
 server.listen(PORT, BIND_HOST, () => {
     log.important(`🚀 Snake Agents running on ${BIND_HOST}:${PORT}`);
+    sendTelegramAlert('✅ Server started on port ' + PORT);
     // Initialize blockchain contracts
     initContracts();
     // Resume bots after a short delay (let rooms initialize)
@@ -4833,4 +5089,34 @@ server.listen(PORT, BIND_HOST, () => {
     };
     cleanupReplays();
     setInterval(cleanupReplays, 24 * 60 * 60 * 1000);
+
+    // --- Periodic health checks (Telegram alerts) ---
+    let _lastBalanceAlert = 0;
+    let _lastMemAlert = 0;
+    let _lastTxFailAlert = 0;
+    setInterval(async () => {
+        const now = Date.now();
+        // Check backend wallet ETH balance
+        if (backendWallet && now - _lastBalanceAlert > 3600_000) {
+            try {
+                const bal = await provider.getBalance(backendWallet.address);
+                if (bal < ethers.parseEther('0.01')) {
+                    _lastBalanceAlert = now;
+                    sendTelegramAlert(`⚠️ Low ETH balance: ${ethers.formatEther(bal)} ETH\nWallet: ${backendWallet.address}`);
+                }
+            } catch (e) {}
+        }
+        // Check TX consecutive failures
+        if (_txConsecutiveFailures > 3 && now - _lastTxFailAlert > 600_000) {
+            _lastTxFailAlert = now;
+            sendTelegramAlert(`🚨 TX queue: ${_txConsecutiveFailures} consecutive failures`);
+        }
+        // Check memory usage
+        const memUsage = process.memoryUsage();
+        const heapPct = memUsage.heapUsed / memUsage.heapTotal;
+        if (heapPct > 0.8 && now - _lastMemAlert > 3600_000) {
+            _lastMemAlert = now;
+            sendTelegramAlert(`⚠️ High memory: ${(heapPct*100).toFixed(1)}% heap used (${Math.round(memUsage.heapUsed/1024/1024)}MB)`);
+        }
+    }, 60_000);
 });
