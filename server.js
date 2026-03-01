@@ -1070,6 +1070,7 @@ const ROOM_MAX_PLAYERS = {
 
 // --- Sandbox Management ---
 let performancePaused = false;
+let maintenanceMode = false; // Emergency shutdown flag — stops all games
 
 function checkWorkerLoad() {
     const count = activeWorkers.size;
@@ -1343,10 +1344,11 @@ class GameRoom {
 
     startLoops() {
         this._intervals.push(setInterval(() => {
+            // Emergency maintenance mode — freeze everything
+            if (maintenanceMode) return;
+
             if (this.type === 'performance' && typeof performancePaused !== 'undefined' && performancePaused) {
-                // If paused, skip tick but maybe broadcast "paused" state?
-                // For MVP, just skip. Clients will see freeze.
-                return; 
+                return;
             }
 
             if (this.gameState === 'PLAYING') {
@@ -2855,6 +2857,13 @@ wss.on('connection', (ws, req) => {
         if (c <= 0) _wsIpCount.delete(wsIp); else _wsIpCount.set(wsIp, c);
     });
 
+    // Reject new connections during maintenance mode
+    if (maintenanceMode) {
+        ws.send(JSON.stringify({ type: 'maintenance', active: true, message: 'Server is under maintenance' }));
+        ws.close(1001, 'Maintenance mode');
+        return;
+    }
+
     let playerId = null;
     let room = null;
     let msgCount = 0;
@@ -3665,6 +3674,52 @@ app.post("/api/admin/full-reset", requireAdminKey, (req, res) => {
     log.important('[Admin] FULL RESET executed — all data wiped');
     sendTelegramAlert('⚠️ FULL RESET executed — all data wiped');
     res.json({ ok: true, message: 'Full reset complete. Restart the server to re-initialize.' });
+});
+
+// Emergency stop: pause all games and bots instantly
+app.post("/api/admin/emergency-stop", requireAdminKey, (req, res) => {
+    if (maintenanceMode) {
+        return res.json({ ok: true, message: 'Already in maintenance mode', maintenanceMode: true });
+    }
+    maintenanceMode = true;
+
+    // Stop all running bot workers
+    let stoppedBots = 0;
+    for (const [botId] of activeWorkers) {
+        stopBotWorker(botId, true);
+        stoppedBots++;
+    }
+
+    // Broadcast maintenance message to all connected clients
+    for (const [, room] of rooms) {
+        room.sendEvent('maintenance', { active: true, message: 'Server is under maintenance' });
+    }
+
+    log.important(`[Admin] EMERGENCY STOP — maintenance mode ON, stopped ${stoppedBots} bots`);
+    sendTelegramAlert(`🚨 EMERGENCY STOP activated — ${stoppedBots} bots stopped, all games paused`);
+    res.json({ ok: true, message: `Emergency stop activated. ${stoppedBots} bots stopped.`, maintenanceMode: true });
+});
+
+// Emergency resume: unpause games
+app.post("/api/admin/emergency-resume", requireAdminKey, (req, res) => {
+    if (!maintenanceMode) {
+        return res.json({ ok: true, message: 'Not in maintenance mode', maintenanceMode: false });
+    }
+    maintenanceMode = false;
+
+    // Broadcast resume to all connected clients
+    for (const [, room] of rooms) {
+        room.sendEvent('maintenance', { active: false });
+    }
+
+    log.important('[Admin] EMERGENCY RESUME — maintenance mode OFF');
+    sendTelegramAlert('✅ Emergency resume — games unpaused');
+    res.json({ ok: true, message: 'Games resumed. Restart bots manually from dashboard.', maintenanceMode: false });
+});
+
+// Maintenance status
+app.get("/api/admin/maintenance-status", requireAdminKey, (req, res) => {
+    res.json({ ok: true, maintenanceMode, activeBots: activeWorkers.size });
 });
 
 // Admin: create bot on-chain for an existing local bot that missed the createBot tx
@@ -5203,8 +5258,8 @@ server.listen(PORT, BIND_HOST, () => {
         }
     }
 
-    // Auto-cleanup replays: delete files older than 36 hours, run every 24h
-    const REPLAY_RETENTION_MS = 36 * 60 * 60 * 1000; // 36 hours
+    // Auto-cleanup replays: delete files older than 7 days, run every 24h
+    const REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
     const cleanupReplays = () => {
         try {
             if (!fs.existsSync(replayDir)) return;
@@ -5213,7 +5268,7 @@ server.listen(PORT, BIND_HOST, () => {
                 .map(f => ({ name: f, mtime: fs.statSync(path.join(replayDir, f)).mtimeMs }));
             const toDelete = files.filter(f => f.mtime < now - REPLAY_RETENTION_MS);
             toDelete.forEach(f => fs.unlinkSync(path.join(replayDir, f.name)));
-            if (toDelete.length > 0) log.important(`[Cleanup] Deleted ${toDelete.length} replays older than 36 hours`);
+            if (toDelete.length > 0) log.important(`[Cleanup] Deleted ${toDelete.length} replays older than 7 days`);
         } catch (e) {
             log.warn('[Cleanup] Replay cleanup failed:', e.message);
         }

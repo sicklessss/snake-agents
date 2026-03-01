@@ -152,6 +152,32 @@ tr:hover{background:#1c2128}
       </div>
     </div>
 
+    <!-- Emergency Controls -->
+    <div class="section" style="border-color:#ff8800">
+      <div class="section-header" style="background:rgba(255,136,0,0.1)">
+        <h2 style="color:#ff8800">Emergency Controls</h2>
+      </div>
+      <div class="section-body">
+        <div id="maintenance-status" style="margin-bottom:12px;padding:8px 12px;border-radius:6px;background:rgba(255,255,255,0.05);font-size:0.9rem">
+          Loading maintenance status...
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px">
+          <button id="btn-emergency-stop" class="btn" style="background:#ff4466;color:#fff;border:none;font-weight:bold" onclick="doEmergencyStop()">Emergency Stop</button>
+          <button id="btn-emergency-resume" class="btn" style="background:#238636;color:#fff;border:none;font-weight:bold;display:none" onclick="doEmergencyResume()">Resume Games</button>
+          <span style="color:#8b949e;font-size:0.85rem">Stops all bots and freezes all game rooms. Does NOT affect on-chain contracts.</span>
+        </div>
+        <div style="border-top:1px solid rgba(255,255,255,0.1);padding-top:12px">
+          <div style="margin-bottom:8px;font-size:0.85rem;color:#8b949e">
+            Contract Pause (requires Owner wallet via MetaMask):
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" style="background:#ff8800;color:#fff;border:none;font-size:0.8rem" onclick="pauseAllContracts()">Pause All Contracts</button>
+            <button class="btn" style="background:#238636;color:#fff;border:none;font-size:0.8rem" onclick="unpauseAllContracts()">Unpause All Contracts</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Danger Zone -->
     <div class="section" style="border-color:#ff4466">
       <div class="section-header" style="background:rgba(255,68,102,0.1)">
@@ -387,6 +413,7 @@ function showDashboard() {
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('dashboard').classList.remove('hidden');
   refreshDashboard();
+  checkMaintenanceStatus();
   refreshTimer = setInterval(refreshDashboard, 30000);
 }
 
@@ -687,6 +714,152 @@ function toast(msg, isErr) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 4000);
+}
+
+// --- Emergency Stop/Resume ---
+async function checkMaintenanceStatus() {
+  try {
+    const data = await apiFetch('/api/admin/maintenance-status');
+    updateMaintenanceUI(data.maintenanceMode, data.activeBots);
+  } catch (e) {
+    document.getElementById('maintenance-status').textContent = 'Failed to load status';
+  }
+}
+
+function updateMaintenanceUI(isActive, activeBots) {
+  const statusEl = document.getElementById('maintenance-status');
+  const stopBtn = document.getElementById('btn-emergency-stop');
+  const resumeBtn = document.getElementById('btn-emergency-resume');
+  if (isActive) {
+    statusEl.innerHTML = '<span style="color:#ff4466;font-weight:bold">MAINTENANCE MODE ACTIVE</span> — All games paused, new connections rejected';
+    statusEl.style.background = 'rgba(255,68,102,0.15)';
+    stopBtn.style.display = 'none';
+    resumeBtn.style.display = '';
+  } else {
+    statusEl.innerHTML = 'Status: <span style="color:#3fb950">Normal</span> — Active bots: ' + (activeBots || 0);
+    statusEl.style.background = 'rgba(255,255,255,0.05)';
+    stopBtn.style.display = '';
+    resumeBtn.style.display = 'none';
+  }
+}
+
+async function doEmergencyStop() {
+  if (!confirm('WARNING: This will immediately stop ALL bots and freeze ALL game rooms.\n\nPlayers will be disconnected. Continue?')) return;
+  try {
+    const data = await apiFetch('/api/admin/emergency-stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    if (data.ok) {
+      toast('Emergency stop activated');
+      updateMaintenanceUI(true, 0);
+    } else {
+      toast('Failed: ' + (data.error || 'unknown'), true);
+    }
+  } catch (e) { toast('Emergency stop failed: ' + e.message, true); }
+}
+
+async function doEmergencyResume() {
+  if (!confirm('Resume all games? Bots will need to be restarted manually.')) return;
+  try {
+    const data = await apiFetch('/api/admin/emergency-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    if (data.ok) {
+      toast('Games resumed');
+      updateMaintenanceUI(false, 0);
+    } else {
+      toast('Failed: ' + (data.error || 'unknown'), true);
+    }
+  } catch (e) { toast('Resume failed: ' + e.message, true); }
+}
+
+// --- Contract Pause/Unpause (via MetaMask Owner wallet) ---
+const PAUSABLE_CONTRACTS = [
+  { name: 'PariMutuel', key: 'pariMutuel' },
+  { name: 'BotRegistry', key: 'botRegistry' },
+  { name: 'RewardDistributor', key: 'rewardDistributor' },
+  { name: 'BotMarketplace', key: 'botMarketplace' }
+];
+const PAUSE_ABI = [
+  'function pause()',
+  'function unpause()',
+  'function paused() view returns (bool)'
+];
+
+async function getEthersProvider() {
+  if (!window.ethereum) { toast('MetaMask not found', true); return null; }
+  await window.ethereum.request({ method: 'eth_requestAccounts' });
+  if (typeof ethers === 'undefined') { toast('ethers.js not loaded', true); return null; }
+  return new ethers.providers.Web3Provider(window.ethereum);
+}
+
+async function pauseAllContracts() {
+  if (!confirm('Pause ALL contracts on-chain? This requires the Owner wallet in MetaMask.')) return;
+  const provider = await getEthersProvider();
+  if (!provider) return;
+  const signer = provider.getSigner();
+  const addr = await signer.getAddress();
+  toast('Connected: ' + addr.slice(0,6) + '...' + addr.slice(-4));
+
+  // Get contract addresses from chain-info
+  let contracts;
+  try {
+    const info = await fetch('/api/chain-info').then(r => r.json());
+    contracts = info.contracts;
+  } catch (e) { toast('Failed to load contract addresses', true); return; }
+
+  let paused = 0, failed = 0;
+  for (const c of PAUSABLE_CONTRACTS) {
+    const address = contracts[c.key];
+    if (!address || address === '0x0000000000000000000000000000000000000000') continue;
+    try {
+      const contract = new ethers.Contract(address, PAUSE_ABI, signer);
+      const isPaused = await contract.paused();
+      if (isPaused) { toast(c.name + ' already paused'); continue; }
+      const tx = await contract.pause();
+      toast(c.name + ' pausing... tx: ' + tx.hash.slice(0,10));
+      await tx.wait();
+      paused++;
+      toast(c.name + ' paused');
+    } catch (e) {
+      failed++;
+      toast(c.name + ' pause failed: ' + (e.reason || e.message), true);
+    }
+  }
+  toast(`Done: ${paused} paused, ${failed} failed`);
+}
+
+async function unpauseAllContracts() {
+  if (!confirm('Unpause ALL contracts on-chain?')) return;
+  const provider = await getEthersProvider();
+  if (!provider) return;
+  const signer = provider.getSigner();
+
+  let contracts;
+  try {
+    const info = await fetch('/api/chain-info').then(r => r.json());
+    contracts = info.contracts;
+  } catch (e) { toast('Failed to load contract addresses', true); return; }
+
+  let unpaused = 0, failed = 0;
+  for (const c of PAUSABLE_CONTRACTS) {
+    const address = contracts[c.key];
+    if (!address || address === '0x0000000000000000000000000000000000000000') continue;
+    try {
+      const contract = new ethers.Contract(address, PAUSE_ABI, signer);
+      const isPaused = await contract.paused();
+      if (!isPaused) { toast(c.name + ' already active'); continue; }
+      const tx = await contract.unpause();
+      toast(c.name + ' unpausing... tx: ' + tx.hash.slice(0,10));
+      await tx.wait();
+      unpaused++;
+      toast(c.name + ' unpaused');
+    } catch (e) {
+      failed++;
+      toast(c.name + ' unpause failed: ' + (e.reason || e.message), true);
+    }
+  }
+  toast(`Done: ${unpaused} unpaused, ${failed} failed`);
 }
 
 // --- Full Reset ---

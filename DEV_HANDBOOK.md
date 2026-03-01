@@ -43,7 +43,7 @@ Snake Agents 是一个多人贪吃蛇 AI 对战平台，玩家上传 JavaScript 
 
 ```
 snake-agents/
-├── server.js                 # 主服务器 (~4500 行): 游戏引擎 + API + WS + 区块链
+├── server.js                 # 主服务器 (~5200 行): 游戏引擎 + API + WS + 区块链
 ├── sandbox-worker.js         # Bot 沙箱 Worker 线程 (isolated-vm)
 ├── src/
 │   ├── App.tsx               # 整个前端 React 应用 (~2800 行)
@@ -98,7 +98,7 @@ snake-agents/
 
 ## 4. 后端架构
 
-`server.js` 是一个约 4500 行的单文件后端，承担所有职责。以下是各区块概览：
+`server.js` 是一个约 5200 行的单文件后端，承担所有职责。以下是各区块概览：
 
 ### 4.1 启动流程
 
@@ -439,7 +439,7 @@ stopBotWorker(botId)
 |------|------|------|
 | BotRegistry | `0x98B2...FA2` | Bot 创建/注册 |
 | SnakeBotNFT | `0x7aC0...B84C` | ERC721 NFT |
-| PariMutuel | `0x4bcf...9649` | USDC 对赌 |
+| PariMutuel | `0xeEd4...078d` | USDC 对赌 + Runner Rewards |
 | RewardDistributor | `0x6c8d...e037` | 奖励分发 |
 | BotMarketplace | `0x690c...38f8` | NFT 市场 |
 | ReferralRewards | `0xA89F...B819` | 推荐奖励 |
@@ -464,12 +464,30 @@ BotRegistered(bytes32 botId, address owner)
 ```
 startGame() → 预创建下下场 createMatch(nextMatchId, startTime)
    ↓
-比赛进行中 → 用户可通过 PariMutuel.placeBet() 下注
+比赛开始后前 10 秒 → 投注窗口开放，用户可 placeBet()
+   ↓
+10 秒后 → lockBetting()，投注关闭
    ↓
 startGameOver() → settleMatch(matchId, winnerBytes32Array)
    ↓
 用户调用 claimWinnings() 领取奖金
 ```
+
+**投注窗口：** 投注仅在比赛开始后的前 10 秒内开放（`matchTimeLeft > MATCH_DURATION - 10`），之后自动锁定。
+
+### 7.5 Runner Rewards（参赛奖励）
+
+PariMutuel 合约将每局赌池的 10% 平台抽成拆分为：
+- **5% 平台手续费** — `accumulatedPlatformFees`，owner 可提取
+- **5% Runner Rewards** — 分配给参赛 Bot，按名次加权
+
+Bot owner 可通过以下方式领取：
+- `claimRunnerRewards(bytes32 botId)` — 领取单个 Bot
+- `claimRunnerRewardsBatch(bytes32[] botIds)` — 批量领取
+
+相关 API：
+- `GET /api/runner-rewards/stats` — 全局累积 Runner Rewards 总额
+- `GET /api/runner-rewards/pending?address=0x...` — 指定钱包下所有 Bot 的待领取奖励
 
 ---
 
@@ -526,8 +544,16 @@ startGameOver() → settleMatch(matchId, winnerBytes32Array)
 | `GET` | `/api/bet/pool?matchId=123` | 赌池信息 |
 | `GET` | `/api/bet/winnings?matchId=123&address=0x...` | 潜在奖金 |
 | `GET` | `/api/pari-mutuel/claimable?address=0x...` | 可领取的奖金列表 |
+| `GET` | `/api/matches/active` | 所有房间中可下注的比赛列表 |
 | `GET` | `/api/portfolio?address=0x...` | 完整投资组合 |
 | `POST` | `/api/score/bet` | 下注后领取积分 |
+
+### Runner Rewards（参赛奖励）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/runner-rewards/stats` | Runner Rewards 全局累积总额 |
+| `GET` | `/api/runner-rewards/pending?address=0x...` | 指定钱包的待领取奖励 |
 
 ### 积分与签到
 
@@ -545,6 +571,20 @@ startGameOver() → settleMatch(matchId, winnerBytes32Array)
 | `POST` | `/api/referral/my-stats` | 我的推荐统计 (需签名) |
 | `POST` | `/api/referral/record` | 记录推荐关系 (TX 证明) |
 | `GET` | `/api/referral/info/:address` | 公开推荐信息 |
+| `GET` | `/api/referral/claim-proof?address=0x...` | 获取推荐奖励链上领取签名 |
+
+### Admin API（需 ADMIN_KEY + TOTP）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/admin/dashboard-data` | 全量 Dashboard 数据 |
+| `GET` | `/api/admin/balances` | 链上合约余额查询 |
+| `GET` | `/api/admin/logs?since=ts&level=info` | 服务器日志 |
+| `GET` | `/api/admin/referral-stats` | 推荐统计 |
+| `GET` | `/api/admin/totp-setup` | TOTP 设置 URI (仅需 ADMIN_KEY) |
+| `POST` | `/api/admin/verify-totp` | TOTP 验证码校验 (仅需 ADMIN_KEY) |
+| `POST` | `/api/admin/create-on-chain` | 手动触发链上 Bot 创建 |
+| `POST` | `/api/admin/reset-leaderboard` | 重置排行榜 |
 
 ### 回放
 
@@ -642,7 +682,10 @@ ws://{host}:{port}/ws?arenaId={roomId}
 
 ### 9.5 速率限制
 
-每个 WS 连接最多 20 条消息/秒，超出部分丢弃。
+- 每个 WS 连接最多 20 条消息/秒，超出部分丢弃
+- 每个 IP 最多 `MAX_WS_PER_IP`（默认 10）个 WebSocket 连接，超限返回 1008 关闭
+
+**IP 检测优先级：** `cf-connecting-ip` → `x-real-ip` → `x-forwarded-for` → `remoteAddress`（Cloudflare Tunnel 环境下使用 `cf-connecting-ip` 获取真实客户端 IP）
 
 ---
 
@@ -719,10 +762,15 @@ transport: http('https://sepolia.base.org')
 
 - `createMatch(uint256 matchId, uint256 startTime)` — Oracle 创建
 - `placeBet(uint256 matchId, bytes32 botId, uint256 amount)` — USDC 下注
+- `lockBetting(uint256 matchId)` — Oracle 锁定投注（比赛开始 10 秒后）
 - `settleMatch(uint256 matchId, bytes32[] winners)` — Oracle 结算 top-3
 - `claimWinnings(uint256 matchId)` — 用户领取
 - `claimRefund(uint256 matchId)` — 未结算比赛退款
-- PariMutuel 分配 + 平台抽成
+- `emergencyRefundMatch(uint256 matchId)` — Oracle 紧急退款
+- `claimRunnerRewards(bytes32 botId)` — Bot owner 领取参赛奖励
+- `claimRunnerRewardsBatch(bytes32[] botIds)` — 批量领取
+- `withdrawPlatformFees()` — Owner 提取平台手续费 (USDC)
+- 抽成分配: 10% 总抽成 = 5% 平台手续费 + 5% Runner Rewards
 
 ### 11.4 RewardDistributor.sol
 
@@ -877,8 +925,16 @@ pm2 monit
 | `ADMIN_KEY` | (无) | 管理 API 密钥 |
 | `BACKEND_PRIVATE_KEY` | (无) | 后端钱包私钥 |
 | `RPC_URL` | `https://sepolia.base.org` | 区块链 RPC |
-| `DATA_DIR` | `/root/snake-data` | 数据存储目录 |
+| `DATA_DIR` | `/home/snake/snake-data` | 数据存储目录 |
 | `LOG_LEVEL` | `info` | 日志级别: debug/info/warn/error |
+| `ADMIN_TOTP_SECRET` | (无) | TOTP 2FA 密钥 (32 字符 base32) |
+| `ALLOWED_ORIGIN` | `*` | CORS 允许的来源域名 |
+| `MAX_GAS_GWEI` | `50` | Gas 价格上限 (gwei) |
+| `MAX_WS_PER_IP` | `10` | 每 IP WebSocket 最大连接数 |
+| `USDC_ADDRESS` | `0x036C...3dCF7e` | USDC 合约地址 |
+| `LOGTAIL_TOKEN` | (无) | Better Stack 日志 Token |
+| `TELEGRAM_BOT_TOKEN` | (无) | Telegram 告警 Bot Token |
+| `TELEGRAM_CHAT_ID` | (无) | Telegram 告警频道 ID |
 | `BOT_REGISTRY_CONTRACT` | (内置) | 覆盖合约地址 |
 | `NFT_CONTRACT` | (内置) | 覆盖 NFT 合约 |
 | `PARIMUTUEL_CONTRACT` | (内置) | 覆盖 PariMutuel 合约 |
@@ -921,4 +977,4 @@ Bot 代码的读写需要通过钱包签名获取 24 小时有效的编辑令牌
 
 ---
 
-> 最后更新: 2026-02-26
+> 最后更新: 2026-02-28
