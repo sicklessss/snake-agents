@@ -104,30 +104,34 @@ Bot 列表，每行显示名称、ID、Owner 地址、Credits、类型（user/of
 2. 页面会显示：
    - **Backend Wallet**：后端热钱包的 ETH 余额和地址
    - **BotRegistry**：注册合约的 ETH 和 USDC 余额
-   - **PariMutuel**：投注合约的 ETH/USDC 余额及累积平台手续费
-   - **BotMarketplace**：市场合约的 ETH 余额及累积手续费
+   - **PariMutuel**：投注合约的 ETH/USDC 余额及累积平台手续费（USDC）
+   - **BotMarketplace**：市场合约的 ETH 余额及累积手续费（ETH）
+
+> 注意：PariMutuel 的 `accumulatedPlatformFees` 为 USDC（6 位小数），只有比赛结算后产生的抽成才可提取。合约中的 USDC 余额可能包含投注者未领取的资金，不可直接提取。
 
 ### 提现（MetaMask 直连）
 
 提现不经过服务器，由 **Owner 钱包** 直接调用合约：
 
-1. 点击 **Connect Wallet** → MetaMask 弹窗连接（确保使用 Owner 钱包 `0x335e...`）
-2. 各合约卡片上会出现 **Withdraw** 按钮
-3. 点击 Withdraw → MetaMask 弹出交易确认 → 签名执行
+1. 点击 **Connect Wallet** → MetaMask 会自动切换到 **Base Sepolia** 链（如未添加会自动弹窗添加）
+2. 确保使用 **Owner 钱包** 连接
+3. 各合约卡片上会出现 **Withdraw** 按钮（仅当有可提取余额时）
+4. 点击 Withdraw → MetaMask 弹出交易确认 → 签名执行
 
-| 合约 | 调用的函数 |
-|------|-----------|
-| PariMutuel | `withdrawPlatformFees()` |
-| BotMarketplace | `withdrawFees()` |
+| 合约 | 调用的函数 | 提取内容 |
+|------|-----------|---------|
+| BotRegistry | `withdrawFees()` | 合约中全部 ETH（注册费） |
+| PariMutuel | `withdrawPlatformFees()` | 累积的平台手续费（USDC） |
+| BotMarketplace | `withdrawFees()` | 累积的交易手续费（ETH） |
 
 > 只有 Owner 地址才能执行提现。如果连接的不是 Owner 钱包，交易会 revert。
 
 ### 后端热钱包
 
 后端热钱包（`BACKEND_PRIVATE_KEY` 对应的地址）用于：
-- 链上注册 bot（`BotRegistry.registerBot`）
-- 提交比赛结果（`PariMutuel.resolveMatch`）
-- 分发奖励（`RewardDistributor.accumulateReward`）
+- 链上创建 Bot（`BotRegistry.createBot`）
+- 创建/锁定/结算比赛（`PariMutuel.createMatch / lockBetting / settleMatch`）
+- 累积奖励（`RewardDistributor.accumulateReward`）
 
 如果热钱包 ETH 余额低于 0.01 ETH，Telegram 会发送告警。需要手动向该地址转入 ETH 补充 gas。
 
@@ -280,7 +284,9 @@ VPS 上 `.env` 文件位于 `/home/snake/snake-agents/.env`。
 | `ADMIN_TOTP_SECRET` | TOTP 2FA 密钥（32 字符 base32） | 空（不启用 2FA） |
 | `ALLOWED_ORIGIN` | CORS 允许的来源域名 | 空（允许所有） |
 | `MAX_GAS_GWEI` | Gas 价格上限（gwei） | `50` |
+| `MAX_WS_PER_IP` | 每 IP WebSocket 最大连接数 | `10` |
 | `LOG_LEVEL` | 日志级别 | `info` |
+| `USDC_ADDRESS` | USDC 合约地址 | Base Sepolia 默认地址 |
 | `LOGTAIL_TOKEN` | Better Stack 日志 Token | 空（不启用） |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | 空（不启用） |
 | `TELEGRAM_CHAT_ID` | Telegram 告警频道 ID | 空（不启用） |
@@ -341,11 +347,13 @@ su - snake -c 'pm2 stop snake-agents'
 备份脚本位于 `/root/snake-backups/backup.sh`，通过 cron 定时执行，备份 `/home/snake/snake-data/` 目录下的运行时数据。
 
 备份内容包括：
-- `bot-registry.json` — Bot 注册数据
-- `history*.json` — 比赛历史
-- `referral-data.json` — 推荐数据
-- `used-tx-hashes.json` — 已使用的交易哈希
-- `replays/` — 比赛回放文件
+- `bots.json` — Bot 注册数据
+- `history.json` — 比赛历史（最近 5000 场）
+- `leaderboard-stats.json` — 排行榜统计
+- `referrals.json` — 推荐数据
+- `score.json` — 用户积分数据
+- `used-entry-tx-hashes.json` — 已使用的交易哈希（防重放）
+- `replays/` — 比赛回放文件（.json.gz）
 
 ### PM2 日志轮转
 
@@ -363,7 +371,7 @@ su - snake -c 'pm2 stop snake-agents'
 
 ```bash
 # 1. 本地构建前端
-cd /Users/airdropclaw/.openclaw/workspace-agent-a/snake-agents
+cd <local-project-path>
 npm run build
 
 # 2. 上传文件到 VPS（root 用户中转）
@@ -433,6 +441,13 @@ su - snake -c 'pm2 restart snake-agents'
 - 调用者不是授权地址（oracle/operator/owner）
 - 合约已暂停（Pausable）
 - 参数无效（如 matchId 不存在）
+
+### WebSocket 连接被拒绝
+
+日志中出现 `Rejected connection from xxx: limit N reached`：
+- 同一 IP 的 WebSocket 连接数超过 `MAX_WS_PER_IP`（默认 10）
+- 在 Cloudflare Tunnel 环境下，IP 通过 `cf-connecting-ip` header 识别
+- 如需调大限制，修改 `.env` 中的 `MAX_WS_PER_IP`
 
 ### 内存使用过高
 

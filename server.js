@@ -1,4 +1,5 @@
-require('dotenv').config();
+const envFile = process.env.ENV_FILE || '.env';
+require('dotenv').config({ path: envFile });
 
 // --- Global error handlers (must be early to catch startup errors) ---
 process.on('uncaughtException', (err) => {
@@ -709,12 +710,13 @@ app.use((req, res, next) => {
 // API rate limiting
 app.use('/api', rateLimit({ windowMs: 60_000, max: 120 }));
 
-// Epoch counter — days since 2026-02-20 (launch date), starting at 1
+// Epoch counter — starting at 1. Duration configurable via EPOCH_DAYS (default 1 day).
 const EPOCH_ORIGIN = new Date('2026-02-20T00:00:00Z');
+const EPOCH_DAYS = parseInt(process.env.EPOCH_DAYS) || 1;
 function getCurrentEpoch() {
     const now = new Date();
     const diffMs = now.getTime() - EPOCH_ORIGIN.getTime();
-    return Math.max(1, Math.floor(diffMs / (24 * 60 * 60 * 1000)) + 1);
+    return Math.max(1, Math.floor(diffMs / (EPOCH_DAYS * 24 * 60 * 60 * 1000)) + 1);
 }
 
 // --- Global History (monthly split) ---
@@ -831,7 +833,7 @@ if (!fs.existsSync(LB_STATS_FILE)) {
     let count = 0;
     for (const h of matchHistory) {
         if (!h.arenaId || !h.winner || (h.winner === 'No Winner' && (h.score || 0) === 0)) continue;
-        const ep = h.epoch || (h.timestamp ? Math.max(1, Math.floor((new Date(h.timestamp).getTime() - EPOCH_ORIGIN.getTime()) / (24*60*60*1000)) + 1) : 0);
+        const ep = h.epoch || (h.timestamp ? Math.max(1, Math.floor((new Date(h.timestamp).getTime() - EPOCH_ORIGIN.getTime()) / (EPOCH_DAYS*24*60*60*1000)) + 1) : 0);
         if (!ep) continue;
         recordWin(h.arenaId, ep, h.winner);
         count++;
@@ -2987,6 +2989,19 @@ function leaderboardFromHistory(filterArenaId = null) {
         .slice(0, 30);
 }
 
+// Chain info endpoint — frontend dynamically configures chain from this
+app.get('/api/chain-info', (req, res) => {
+    const chainId = parseInt(process.env.CHAIN_ID) || 84532;
+    res.json({
+        chainId,
+        rpcUrl: process.env.PUBLIC_RPC_URL || process.env.RPC_URL || 'https://sepolia.base.org',
+        chainName: chainId === 8453 ? 'Base' : 'Base Sepolia',
+        blockExplorer: chainId === 8453 ? 'https://basescan.org' : 'https://sepolia.basescan.org',
+        contracts: CONTRACTS,
+        usdc: process.env.USDC_ADDRESS || '0x036CbD53842c5426634e7929541eC2318f3dCF7e'
+    });
+});
+
 app.post('/api/bot/register', rateLimit({ windowMs: 60_000, max: 10 }), async (req, res) => {
     const { name, price, owner, botType, regCode } = req.body || {};
 
@@ -3601,6 +3616,55 @@ app.post("/api/admin/reset-leaderboard", requireAdminKey, (req, res) => {
     try { fs.writeFileSync(f, "[]"); } catch (e) {}
     log.important("[Admin] Leaderboard reset");
     res.json({ ok: true, message: "Leaderboard reset" });
+});
+
+// Full reset: wipe all data (leaderboard, bots, history, counters, epoch) — for mainnet testing
+app.post("/api/admin/full-reset", requireAdminKey, (req, res) => {
+    const confirm = req.body?.confirm;
+    if (confirm !== 'FULL_RESET') {
+        return res.status(400).json({ error: 'Send { "confirm": "FULL_RESET" } to confirm' });
+    }
+
+    // 1. Stop all running bots
+    for (const [botId, bot] of Object.entries(botRegistry)) {
+        if (bot.running) bot.running = false;
+    }
+
+    // 2. Clear match history
+    matchHistory = [];
+    matchNumber = 0;
+    const mf = historyMonthFile(currentMonth());
+    try { fs.writeFileSync(mf, '[]'); } catch (e) {}
+
+    // 3. Clear leaderboard stats
+    lbStats = { perf: {}, comp: {} };
+    _lbStatsDirty = false;
+    try { fs.writeFileSync(LB_STATS_FILE, JSON.stringify(lbStats)); } catch (e) {}
+
+    // 4. Clear bots
+    botRegistry = {};
+    try { fs.writeFileSync(BOT_DB_FILE, '{}'); } catch (e) {}
+
+    // 5. Reset match counters
+    roomCounters = { A: 1, B: 1, C: 1, D: 1, E: 1, F: 1, P: 1 };
+    saveCounters();
+
+    // 6. Clear score data
+    try { fs.writeFileSync(SCORE_DATA_FILE, '{}'); } catch (e) {}
+
+    // 7. Clear paid entries
+    try { savePaidEntries({}); } catch (e) {}
+
+    // 8. Clear referral data
+    referralData = { users: {}, rewards: {} };
+    try { atomicWriteFile(REFERRAL_DATA_FILE, JSON.stringify(referralData)); } catch (e) {}
+
+    // 9. Clear replay index
+    try { fs.writeFileSync(path.join(DATA_DIR, 'replay-index.json'), '[]'); } catch (e) {}
+
+    log.important('[Admin] FULL RESET executed — all data wiped');
+    sendTelegramAlert('⚠️ FULL RESET executed — all data wiped');
+    res.json({ ok: true, message: 'Full reset complete. Restart the server to re-initialize.' });
 });
 
 // Admin: create bot on-chain for an existing local bot that missed the createBot tx
@@ -4234,6 +4298,9 @@ app.post('/api/score/bet', async (req, res) => {
     }
 
     const addr = address.toLowerCase();
+    if (getDailyCount(addr, 'bet_') >= DAILY_BET_CAP) {
+        return res.json({ ok: true, awarded: 0, total: (userScores[addr] || { total: 0 }).total, capped: true });
+    }
     const pts = Math.max(1, Math.floor(parseFloat(amount) || 1));
     awardScore(addr, 'bet_activity', pts, { matchId, botId });
     const user = userScores[addr] || { total: 0 };
@@ -4766,7 +4833,7 @@ app.get('/api/bot/rewards/:botId', async (req, res) => {
 const REFERRAL_DOMAIN = {
     name: 'SnakeAgentsReferral',
     version: '1',
-    chainId: 84532 // Base Sepolia
+    chainId: parseInt(process.env.CHAIN_ID) || 84532
 };
 
 // Verify wallet signature

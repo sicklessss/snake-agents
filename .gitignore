@@ -18,5 +18,11 @@ debug*.js
 claim-all*.js
 transfer-ownership.js
 
-# Deployment scripts (contain hardcoded keys)
+# Deployment scripts (one-time use)
 deploy-parimutuel.js
+deploy-continue.js
+deployment-mainnet.json
+
+# Secrets
+mainnet-secrets.env
+*.secrets.*

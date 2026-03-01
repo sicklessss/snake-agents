@@ -1,5 +1,5 @@
 /**
- * deploy-all.js — One-shot deployment of all Snake Agents contracts to Base Sepolia
+ * deploy-all.js — One-shot deployment of all Snake Agents contracts
  *
  * Prerequisites:
  *   npx hardhat compile          (generates artifacts/)
@@ -11,8 +11,8 @@
 import { ethers } from "ethers";
 import fs from "fs";
 
-const RPC_URL = "https://sepolia.base.org";
-const USDC_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+const RPC_URL = process.env.RPC_URL || "https://sepolia.base.org";
+const USDC_ADDRESS = process.env.USDC_ADDRESS || "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const OWNER_ADDRESS = process.env.OWNER_ADDRESS || "0x335e151514e96cbd1a79b44c8fb7937abe333ba3";
 
 const BACKEND_KEY = process.env.BACKEND_PRIVATE_KEY;
@@ -32,7 +32,7 @@ async function deploy(name, artifact, args = [], nonceVal) {
   console.log(`\nDeploying ${name}...`);
   const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
   const tx = await factory.getDeployTransaction(...args);
-  const sent = await wallet.sendTransaction({ ...tx, nonce: nonceVal, gasLimit: 5_000_000 });
+  const sent = await wallet.sendTransaction({ ...tx, nonce: nonceVal, gasLimit: 8_000_000 });
   console.log(`  tx: ${sent.hash}`);
   const receipt = await sent.wait();
   const addr = receipt.contractAddress;
@@ -65,8 +65,8 @@ async function main() {
   // 3. RewardDistributor(botRegistry)
   const reward = await deploy("RewardDistributor", rewardArtifact, [registry.address], nonce++);
 
-  // 4. SnakeAgentsPariMutuel(usdc)
-  const pari = await deploy("SnakeAgentsPariMutuel", pariArtifact, [USDC_ADDRESS], nonce++);
+  // 4. SnakeAgentsPariMutuel(usdc, botRegistry)
+  const pari = await deploy("SnakeAgentsPariMutuel", pariArtifact, [USDC_ADDRESS, registry.address], nonce++);
 
   // 5. ReferralRewards(signer = backend wallet)
   const referral = await deploy("ReferralRewards", referralArtifact, [wallet.address], nonce++);
@@ -160,9 +160,10 @@ async function main() {
   }
 
   // --- Save deployment info ---
+  const { chainId } = await provider.getNetwork();
   const deployment = {
-    network: "baseSepolia",
-    chainId: 84532,
+    network: Number(chainId) === 8453 ? "baseMainnet" : "baseSepolia",
+    chainId: Number(chainId),
     deployer: wallet.address,
     contracts: {
       SnakeBotNFT: nft.address,

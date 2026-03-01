@@ -152,6 +152,17 @@ tr:hover{background:#1c2128}
       </div>
     </div>
 
+    <!-- Danger Zone -->
+    <div class="section" style="border-color:#ff4466">
+      <div class="section-header" style="background:rgba(255,68,102,0.1)">
+        <h2 style="color:#ff4466">Danger Zone</h2>
+      </div>
+      <div class="section-body" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <button class="btn" style="background:#ff4466;color:#fff;border:none" onclick="doFullReset()">Full Reset (Wipe All Data)</button>
+        <span style="color:#8b949e;font-size:0.85rem">Clears all bots, leaderboard, history, match counters, referrals. Requires confirmation.</span>
+      </div>
+    </div>
+
     <!-- Arena Status -->
     <div class="section">
       <div class="section-header"><h2>Arena Status</h2></div>
@@ -242,15 +253,29 @@ const WITHDRAW_ABI_PM = ['function withdrawPlatformFees() external'];
 const WITHDRAW_ABI_MKT = ['function withdrawFees() external'];
 const WITHDRAW_ABI_REG = ['function withdrawFees() external'];
 
-// Base Sepolia chain config
-const BASE_SEPOLIA_CHAIN_ID = '0x14a34'; // 84532
-const BASE_SEPOLIA_CHAIN = {
-  chainId: BASE_SEPOLIA_CHAIN_ID,
+// Dynamic chain config — loaded from /api/chain-info
+let CHAIN_CONFIG = {
+  chainId: '0x14a34',
   chainName: 'Base Sepolia',
   nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
   rpcUrls: ['https://sepolia.base.org'],
   blockExplorerUrls: ['https://sepolia.basescan.org']
 };
+let CHAIN_ID_HEX = '0x14a34';
+let CHAIN_ID_NUM = 84532;
+
+// Fetch chain info from backend
+fetch('/api/chain-info').then(r => r.json()).then(info => {
+  CHAIN_ID_NUM = info.chainId;
+  CHAIN_ID_HEX = '0x' + info.chainId.toString(16);
+  CHAIN_CONFIG = {
+    chainId: CHAIN_ID_HEX,
+    chainName: info.chainName || (info.chainId === 8453 ? 'Base' : 'Base Sepolia'),
+    nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+    rpcUrls: [info.rpcUrl || 'https://sepolia.base.org'],
+    blockExplorerUrls: [info.blockExplorer || 'https://sepolia.basescan.org']
+  };
+}).catch(e => console.warn('Failed to load chain-info:', e));
 
 // --- Auth ---
 let loginAttempts = 0;
@@ -555,13 +580,13 @@ async function connectMetaMask() {
   }
   try {
     await window.ethereum.request({ method: 'eth_requestAccounts' });
-    // Switch to Base Sepolia
+    // Switch to target chain
     try {
-      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }] });
+      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: CHAIN_ID_HEX }] });
     } catch (switchErr) {
       // Chain not added yet — add it
       if (switchErr.code === 4902) {
-        await window.ethereum.request({ method: 'wallet_addEthereumChain', params: [BASE_SEPOLIA_CHAIN] });
+        await window.ethereum.request({ method: 'wallet_addEthereumChain', params: [CHAIN_CONFIG] });
       } else {
         throw switchErr;
       }
@@ -570,10 +595,10 @@ async function connectMetaMask() {
     mmSigner = mmProvider.getSigner();
     const addr = await mmSigner.getAddress();
     const network = await mmProvider.getNetwork();
-    document.getElementById('btnConnectMM').textContent = shortAddr(addr) + ' (Base Sepolia)';
+    document.getElementById('btnConnectMM').textContent = shortAddr(addr) + ' (' + CHAIN_CONFIG.chainName + ')';
     document.getElementById('btnConnectMM').classList.remove('btn-purple');
     document.getElementById('btnConnectMM').classList.add('btn-green');
-    toast('Wallet connected on Base Sepolia: ' + shortAddr(addr));
+    toast('Wallet connected on ' + CHAIN_CONFIG.chainName + ': ' + shortAddr(addr));
     refreshBalances();
   } catch (e) {
     toast('Wallet connection failed: ' + e.message, true);
@@ -582,12 +607,12 @@ async function connectMetaMask() {
 
 async function doWithdrawMM(contractKey, contractAddr) {
   if (!mmSigner) { toast('Connect wallet first', true); return; }
-  // Verify we're on Base Sepolia
+  // Verify we're on the correct chain
   const network = await mmProvider.getNetwork();
-  if (network.chainId !== 84532) {
-    toast('Please switch to Base Sepolia chain first', true);
+  if (network.chainId !== CHAIN_ID_NUM) {
+    toast('Please switch to ' + CHAIN_CONFIG.chainName + ' chain first', true);
     try {
-      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: BASE_SEPOLIA_CHAIN_ID }] });
+      await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: CHAIN_ID_HEX }] });
       mmProvider = new ethers.providers.Web3Provider(window.ethereum);
       mmSigner = mmProvider.getSigner();
     } catch (e) { return; }
@@ -662,6 +687,27 @@ function toast(msg, isErr) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 4000);
+}
+
+// --- Full Reset ---
+async function doFullReset() {
+  if (!confirm('WARNING: This will DELETE ALL DATA (bots, leaderboard, history, referrals).\n\nAre you sure?')) return;
+  const typed = prompt('Type FULL_RESET to confirm:');
+  if (typed !== 'FULL_RESET') { toast('Reset cancelled', true); return; }
+  try {
+    const data = await apiFetch('/api/admin/full-reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'FULL_RESET' })
+    });
+    if (data.ok) {
+      toast('Full reset complete! Restarting server...');
+      // Auto-restart via PM2 would be ideal, but just refresh after delay
+      setTimeout(() => location.reload(), 3000);
+    } else {
+      toast('Reset failed: ' + (data.error || 'unknown'), true);
+    }
+  } catch (e) { toast('Reset failed: ' + e.message, true); }
 }
 
 // --- Init ---

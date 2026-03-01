@@ -4,26 +4,32 @@ import { injected, metaMask, coinbaseWallet } from 'wagmi/connectors';
 import { parseEther, parseUnits, stringToHex, padHex, createPublicClient, http } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { WagmiProvider } from 'wagmi';
-import { baseSepolia } from 'wagmi/chains';
+import { base, baseSepolia } from 'wagmi/chains';
 import './index.css';
 import { CONTRACTS, BOT_REGISTRY_ABI, PARI_MUTUEL_ABI, ERC20_ABI, BOT_MARKETPLACE_ABI, SNAKE_BOT_NFT_ABI } from './contracts';
 import foodSvgUrl from './assets/food.svg';
 
-// --- CONFIG (multi-wallet, no WalletConnect dependency) ---
+// --- CONFIG (multi-wallet, supports both Base and Base Sepolia) ---
 const config = createConfig({
-  chains: [baseSepolia],
+  chains: [baseSepolia, base],
   connectors: [
     injected(),
     metaMask(),
     coinbaseWallet({ appName: 'Snake Agents' }),
   ],
   multiInjectedProviderDiscovery: true,
-  transports: { [baseSepolia.id]: wagmiHttp('https://sepolia.base.org') },
+  transports: {
+    [baseSepolia.id]: wagmiHttp('https://sepolia.base.org'),
+    [base.id]: wagmiHttp('https://mainnet.base.org'),
+  },
 });
 
 const queryClient = new QueryClient();
 
-const publicClient = createPublicClient({ chain: baseSepolia, transport: http('https://sepolia.base.org') });
+// Dynamic chain state — updated from /api/chain-info before any component renders
+let activeChain: typeof baseSepolia | typeof base = baseSepolia;
+let activeContracts: typeof CONTRACTS = { ...CONTRACTS };
+let publicClient = createPublicClient({ chain: baseSepolia, transport: http('https://sepolia.base.org') });
 
 
 const PERFORMANCE_RULES = `游戏介绍
@@ -157,8 +163,8 @@ function WalletButton() {
 
   const handleClaim = async () => {
     if (!claimable.length || claiming) return;
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setClaimStatus('Please switch to Base Sepolia'); return; }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { setClaimStatus(('Please switch to ' + activeChain.name)); return; }
     }
     setClaiming(true);
     setClaimStatus('Claiming...');
@@ -166,18 +172,18 @@ function WalletButton() {
     for (const item of claimable) {
       try {
         const claimGas = await estimateGas({
-          address: CONTRACTS.pariMutuel as `0x${string}`,
+          address: activeContracts.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
           account: address as `0x${string}`,
         });
         await writeContractAsync({
-          address: CONTRACTS.pariMutuel as `0x${string}`,
+          address: activeContracts.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          chainId: baseSepolia.id,
+          chainId: activeChain.id,
           ...(claimGas ? { gas: claimGas } : {}),
         });
         claimed++;
@@ -237,7 +243,7 @@ function WalletButton() {
               boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
             }}>
               <div style={{ padding: '6px 10px', fontSize: '0.75rem', color: 'var(--text-dim)', borderBottom: '1px solid #1b1b3b', marginBottom: 4 }}>
-                Base Sepolia
+                {activeChain.name}
               </div>
               <button
                 onClick={() => { navigator.clipboard.writeText(address); setShowMenu(false); }}
@@ -547,12 +553,12 @@ function BotManagement() {
       await new Promise(r => setTimeout(r, 5000));
 
       // Ensure wallet is on Base Sepolia (critical for OKX and other wallets)
-      if (chain?.id !== baseSepolia.id) {
-        setRegStatus('Switching to Base Sepolia...');
+      if (chain?.id !== activeChain.id) {
+        setRegStatus('Switching to ' + activeChain.name + '...');
         try {
-          await switchChainAsync({ chainId: baseSepolia.id });
+          await switchChainAsync({ chainId: activeChain.id });
         } catch (switchErr: any) {
-          setRegStatus('⚠️ Please manually switch your wallet to Base Sepolia (chain 84532)');
+          setRegStatus('⚠️ Please manually switch your wallet to ' + activeChain.name + ' (chain ' + activeChain.id + ')');
           return;
         }
       }
@@ -562,7 +568,7 @@ function BotManagement() {
       const regArgs = [botId32, '0x0000000000000000000000000000000000000000' as `0x${string}`] as const;
       const regValue = parseEther('0.01');
       const gas = await estimateGas({
-        address: CONTRACTS.botRegistry as `0x${string}`,
+        address: activeContracts.botRegistry as `0x${string}`,
         abi: BOT_REGISTRY_ABI,
         functionName: 'registerBot',
         args: [...regArgs],
@@ -570,17 +576,17 @@ function BotManagement() {
         account: address as `0x${string}`,
       });
       setRegStatus(`Sign on-chain registration (0.01 ETH)...`);
-      console.log('[Register] writeContractAsync params:', { botId: data.id, botId32, address: CONTRACTS.botRegistry, wallet: address, gas: gas?.toString() });
+      console.log('[Register] writeContractAsync params:', { botId: data.id, botId32, address: activeContracts.botRegistry, wallet: address, gas: gas?.toString() });
       setRegPending(true);
       setRegError(null);
       try {
         const hash = await writeContractAsync({
-          address: CONTRACTS.botRegistry as `0x${string}`,
+          address: activeContracts.botRegistry as `0x${string}`,
           abi: BOT_REGISTRY_ABI,
           functionName: 'registerBot',
           args: [...regArgs],
           value: regValue,
-          chainId: baseSepolia.id,
+          chainId: activeChain.id,
           ...(gas ? { gas } : {}),
         });
         setRegHash(hash as `0x${string}`);
@@ -597,7 +603,7 @@ function BotManagement() {
         } else if (reason.includes('user rejected') || reason.includes('denied')) {
           setRegStatus('Transaction cancelled.');
         } else if (reason.includes('chain') || reason.includes('network') || reason.includes('switch')) {
-          setRegStatus('⚠️ Please switch your wallet to Base Sepolia network (chainId: 84532)');
+          setRegStatus('⚠️ Please switch your wallet to ' + activeChain.name + ' network (chainId: ' + activeChain.id + ')');
         } else {
           setRegStatus('⚠️ Registration failed: ' + (e?.shortMessage || e?.message || 'Unknown error') + (details ? ' | ' + details : ''));
         }
@@ -614,8 +620,8 @@ function BotManagement() {
     if (!sellBot || !sellPrice) return;
     const priceNum = parseFloat(sellPrice);
     if (isNaN(priceNum) || priceNum <= 0) return alert('Enter a valid price');
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setSellStatus('Please switch to Base Sepolia'); return; }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { setSellStatus(('Please switch to ' + activeChain.name)); return; }
     }
     setSellBusy(true);
     setSellStatus('Looking up NFT tokenId...');
@@ -623,7 +629,7 @@ function BotManagement() {
       const botIdHex = nameToBytes32(sellBot.botId);
       // Get tokenId from NFT contract
       const tokenId = await publicClient.readContract({
-        address: CONTRACTS.snakeBotNFT as `0x${string}`,
+        address: activeContracts.snakeBotNFT as `0x${string}`,
         abi: SNAKE_BOT_NFT_ABI,
         functionName: 'botToTokenId',
         args: [botIdHex],
@@ -637,7 +643,7 @@ function BotManagement() {
       // Verify caller owns the NFT
       setSellStatus('Verifying NFT ownership...');
       const nftOwner = await publicClient.readContract({
-        address: CONTRACTS.snakeBotNFT as `0x${string}`,
+        address: activeContracts.snakeBotNFT as `0x${string}`,
         abi: SNAKE_BOT_NFT_ABI,
         functionName: 'ownerOf',
         args: [tokenId],
@@ -650,26 +656,26 @@ function BotManagement() {
 
       // Step 1: Check if already approved, skip if so
       const currentApproval = await publicClient.readContract({
-        address: CONTRACTS.snakeBotNFT as `0x${string}`,
+        address: activeContracts.snakeBotNFT as `0x${string}`,
         abi: SNAKE_BOT_NFT_ABI,
         functionName: 'getApproved',
         args: [tokenId],
       }) as string;
-      if (currentApproval.toLowerCase() !== (CONTRACTS.botMarketplace as string).toLowerCase()) {
+      if (currentApproval.toLowerCase() !== (activeContracts.botMarketplace as string).toLowerCase()) {
         setSellStatus('1/2 Approving marketplace...');
         const approveGas = await estimateGas({
-          address: CONTRACTS.snakeBotNFT as `0x${string}`,
+          address: activeContracts.snakeBotNFT as `0x${string}`,
           abi: SNAKE_BOT_NFT_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
+          args: [activeContracts.botMarketplace as `0x${string}`, tokenId],
           account: address as `0x${string}`,
         });
         const approveTx = await writeContractAsync({
-          address: CONTRACTS.snakeBotNFT as `0x${string}`,
+          address: activeContracts.snakeBotNFT as `0x${string}`,
           abi: SNAKE_BOT_NFT_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.botMarketplace as `0x${string}`, tokenId],
-          chainId: baseSepolia.id,
+          args: [activeContracts.botMarketplace as `0x${string}`, tokenId],
+          chainId: activeChain.id,
           ...(approveGas ? { gas: approveGas } : {}),
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
@@ -678,12 +684,12 @@ function BotManagement() {
         for (let i = 0; i < 30; i++) {
           await new Promise(r => setTimeout(r, 2000));
           const newApproval = await publicClient.readContract({
-            address: CONTRACTS.snakeBotNFT as `0x${string}`,
+            address: activeContracts.snakeBotNFT as `0x${string}`,
             abi: SNAKE_BOT_NFT_ABI,
             functionName: 'getApproved',
             args: [tokenId],
           }) as string;
-          if (newApproval.toLowerCase() === (CONTRACTS.botMarketplace as string).toLowerCase()) break;
+          if (newApproval.toLowerCase() === (activeContracts.botMarketplace as string).toLowerCase()) break;
         }
       }
 
@@ -695,18 +701,18 @@ function BotManagement() {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const listGas = await estimateGas({
-            address: CONTRACTS.botMarketplace as `0x${string}`,
+            address: activeContracts.botMarketplace as `0x${string}`,
             abi: BOT_MARKETPLACE_ABI,
             functionName: 'list',
             args: [tokenId, priceWei],
             account: address as `0x${string}`,
           });
           listTx = await writeContractAsync({
-            address: CONTRACTS.botMarketplace as `0x${string}`,
+            address: activeContracts.botMarketplace as `0x${string}`,
             abi: BOT_MARKETPLACE_ABI,
             functionName: 'list',
             args: [tokenId, priceWei],
-            chainId: baseSepolia.id,
+            chainId: activeChain.id,
             ...(listGas ? { gas: listGas } : {}),
           }) as unknown as string;
           break;
@@ -980,8 +986,8 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
   }, []);
 
   const handlePredict = async () => {
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { return alert(('Please switch to ' + activeChain.name)); }
     }
     const input = targetMatch.trim().toUpperCase();
     if (!/^[A-FP]\d+$/.test(input)) return alert('请输入比赛编号，如 A5 或 P3');
@@ -1005,7 +1011,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
       // Step 0: Check USDC balance
       setStatus('检查 USDC 余额...');
       const usdcBalance = await publicClient.readContract({
-        address: CONTRACTS.usdc as `0x${string}`,
+        address: activeContracts.usdc as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'balanceOf',
         args: [address],
@@ -1013,7 +1019,7 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
 
       if (usdcBalance < usdcAmount) {
         const balStr = (Number(usdcBalance) / 1e6).toFixed(2);
-        setStatus(`❌ USDC 余额不足：当前 ${balStr} USDC，需要 ${amount} USDC。请先在 Base Sepolia 获取测试 USDC`);
+        setStatus(`❌ USDC 余额不足：当前 ${balStr} USDC，需要 ${amount} USDC。${activeChain.id === 84532 ? '请先在 Base Sepolia 获取测试 USDC' : '请确保钱包有足够 USDC'}`);
         setBusy(false);
         return;
       }
@@ -1024,13 +1030,13 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
       for (let attempt = 0; attempt < 6; attempt++) {
         try {
           const matchData = await publicClient.readContract({
-            address: CONTRACTS.pariMutuel as `0x${string}`,
+            address: activeContracts.pariMutuel as `0x${string}`,
             abi: PARI_MUTUEL_ABI,
             functionName: 'matches',
             args: [BigInt(mid)],
           }) as any;
           if (matchData && matchData[0] !== 0n) {
-            if (matchData[4]) { // settled
+            if (matchData[5]) { // settled
               setStatus('❌ 该比赛已结算');
               setBusy(false);
               return;
@@ -1053,27 +1059,27 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
       // Step 2: Check USDC allowance, approve max if needed
       setStatus('检查 USDC 授权...');
       const currentAllowance = await publicClient.readContract({
-        address: CONTRACTS.usdc as `0x${string}`,
+        address: activeContracts.usdc as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'allowance',
-        args: [address, CONTRACTS.pariMutuel as `0x${string}`],
+        args: [address, activeContracts.pariMutuel as `0x${string}`],
       }) as bigint;
 
       if (currentAllowance < usdcAmount) {
         setStatus('授权 USDC...');
         const usdcApproveGas = await estimateGas({
-          address: CONTRACTS.usdc as `0x${string}`,
+          address: activeContracts.usdc as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.pariMutuel as `0x${string}`, usdcAmount],
+          args: [activeContracts.pariMutuel as `0x${string}`, usdcAmount],
           account: address as `0x${string}`,
         });
         const approveTx = await writeContractAsync({
-          address: CONTRACTS.usdc as `0x${string}`,
+          address: activeContracts.usdc as `0x${string}`,
           abi: ERC20_ABI,
           functionName: 'approve',
-          args: [CONTRACTS.pariMutuel as `0x${string}`, usdcAmount],
-          chainId: baseSepolia.id,
+          args: [activeContracts.pariMutuel as `0x${string}`, usdcAmount],
+          chainId: activeChain.id,
           ...(usdcApproveGas ? { gas: usdcApproveGas } : {}),
         });
         await publicClient.waitForTransactionReceipt({ hash: approveTx as `0x${string}` });
@@ -1082,18 +1088,18 @@ function Prediction({ displayMatchId, nextMatch, epoch, arenaType, bettingOpen, 
       // Step 3: Place bet on-chain (USDC, no ETH value)
       setStatus('签名预测交易...');
       const betGas = await estimateGas({
-        address: CONTRACTS.pariMutuel as `0x${string}`,
+        address: activeContracts.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
         args: [BigInt(mid), botIdBytes32, usdcAmount],
         account: address as `0x${string}`,
       });
       const betTx = await writeContractAsync({
-        address: CONTRACTS.pariMutuel as `0x${string}`,
+        address: activeContracts.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'placeBet',
         args: [BigInt(mid), botIdBytes32, usdcAmount],
-        chainId: baseSepolia.id,
+        chainId: activeChain.id,
         ...(betGas ? { gas: betGas } : {}),
       });
 
@@ -1198,8 +1204,8 @@ function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null })
     if (!isConnected || !address) return alert('Connect Wallet');
     if (!botName) return alert('Enter Bot Name');
     if (!targetMatch) return alert('Enter target match (e.g. A3)');
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { return alert(('Please switch to ' + activeChain.name)); }
     }
 
     setBusy(true);
@@ -1220,7 +1226,7 @@ function CompetitiveEnter({ displayMatchId }: { displayMatchId: string | null })
       const txHash = await sendTransactionAsync({
         to: '0xe4b92D0B4D9Ae8EA89934D1C2E39aCbb86824DAF' as `0x${string}`,
         value: parseEther('0.001'),
-        chainId: baseSepolia.id,
+        chainId: activeChain.id,
         gas: 21000n, // Simple ETH transfer is always 21000
       });
 
@@ -1866,8 +1872,8 @@ function PortfolioPage() {
 
   const handleClaimAll = async () => {
     if (!data?.claimable?.length || claiming) return;
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setClaimStatus('Please switch to Base Sepolia'); return; }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { setClaimStatus(('Please switch to ' + activeChain.name)); return; }
     }
     setClaiming(true);
     setClaimStatus('Claiming...');
@@ -1875,18 +1881,18 @@ function PortfolioPage() {
     for (const item of data.claimable) {
       try {
         const claimGas2 = await estimateGas({
-          address: CONTRACTS.pariMutuel as `0x${string}`,
+          address: activeContracts.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
           account: address as `0x${string}`,
         });
         await writeContractAsync({
-          address: CONTRACTS.pariMutuel as `0x${string}`,
+          address: activeContracts.pariMutuel as `0x${string}`,
           abi: PARI_MUTUEL_ABI,
           functionName: 'claimWinnings',
           args: [BigInt(item.matchId)],
-          chainId: baseSepolia.id,
+          chainId: activeChain.id,
           ...(claimGas2 ? { gas: claimGas2 } : {}),
         });
         claimed++;
@@ -1908,26 +1914,26 @@ function PortfolioPage() {
 
   const handleClaimRunnerRewards = async () => {
     if (!runnerRewards.bots.length || claimingRunner) return;
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { setRunnerClaimStatus('Please switch to Base Sepolia'); return; }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { setRunnerClaimStatus(('Please switch to ' + activeChain.name)); return; }
     }
     setClaimingRunner(true);
     setRunnerClaimStatus('Claiming runner rewards...');
     try {
       const botIds = runnerRewards.bots.map((b: any) => b.botId);
       const gas = await estimateGas({
-        address: CONTRACTS.pariMutuel as `0x${string}`,
+        address: activeContracts.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'claimRunnerRewardsBatch',
         args: [botIds],
         account: address as `0x${string}`,
       });
       await writeContractAsync({
-        address: CONTRACTS.pariMutuel as `0x${string}`,
+        address: activeContracts.pariMutuel as `0x${string}`,
         abi: PARI_MUTUEL_ABI,
         functionName: 'claimRunnerRewardsBatch',
         args: [botIds],
-        chainId: baseSepolia.id,
+        chainId: activeChain.id,
         ...(gas ? { gas } : {}),
       });
       setRunnerClaimStatus('Runner rewards claimed!');
@@ -2186,8 +2192,8 @@ function MarketplacePage() {
 
   const handleBuy = async (item: any) => {
     if (!isConnected || !address) return alert('Please connect wallet first');
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { return alert(('Please switch to ' + activeChain.name)); }
     }
     const tokenId = item.tokenId;
     const priceWei = item.priceWei;
@@ -2196,7 +2202,7 @@ function MarketplacePage() {
     setActionStatus('Signing transaction...');
     try {
       const buyGas = await estimateGas({
-        address: CONTRACTS.botMarketplace as `0x${string}`,
+        address: activeContracts.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'buy',
         args: [BigInt(tokenId)],
@@ -2204,12 +2210,12 @@ function MarketplacePage() {
         account: address as `0x${string}`,
       });
       const txHash = await writeContractAsync({
-        address: CONTRACTS.botMarketplace as `0x${string}`,
+        address: activeContracts.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'buy',
         args: [BigInt(tokenId)],
         value: BigInt(priceWei),
-        chainId: baseSepolia.id,
+        chainId: activeChain.id,
         ...(buyGas ? { gas: buyGas } : {}),
       });
       setActionStatus('Confirming...');
@@ -2238,25 +2244,25 @@ function MarketplacePage() {
 
   const handleCancel = async (item: any) => {
     if (!isConnected) return alert('Connect wallet first');
-    if (chain?.id !== baseSepolia.id) {
-      try { await switchChainAsync({ chainId: baseSepolia.id }); } catch { return alert('Please switch to Base Sepolia'); }
+    if (chain?.id !== activeChain.id) {
+      try { await switchChainAsync({ chainId: activeChain.id }); } catch { return alert(('Please switch to ' + activeChain.name)); }
     }
     setActionId(item.tokenId);
     setActionStatus('Cancelling...');
     try {
       const cancelGas = await estimateGas({
-        address: CONTRACTS.botMarketplace as `0x${string}`,
+        address: activeContracts.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'cancel',
         args: [BigInt(item.tokenId)],
         account: address as `0x${string}`,
       });
       const txHash = await writeContractAsync({
-        address: CONTRACTS.botMarketplace as `0x${string}`,
+        address: activeContracts.botMarketplace as `0x${string}`,
         abi: BOT_MARKETPLACE_ABI,
         functionName: 'cancel',
         args: [BigInt(item.tokenId)],
-        chainId: baseSepolia.id,
+        chainId: activeChain.id,
         ...(cancelGas ? { gas: cancelGas } : {}),
       });
       setActionStatus('Confirming...');
@@ -2700,6 +2706,21 @@ const controlBtnStyle: React.CSSProperties = {
 };
 
 function App() {
+  const [chainReady, setChainReady] = useState(false);
+
+  // Fetch chain config from backend on mount
+  useEffect(() => {
+    fetch('/api/chain-info')
+      .then(r => r.json())
+      .then(info => {
+        activeChain = info.chainId === 8453 ? base : baseSepolia;
+        activeContracts = { ...CONTRACTS, ...info.contracts, usdc: info.usdc || CONTRACTS.usdc };
+        publicClient = createPublicClient({ chain: activeChain, transport: http(info.rpcUrl) });
+        setChainReady(true);
+      })
+      .catch(() => setChainReady(true)); // fallback to defaults
+  }, []);
+
   const [, setMatchId] = useState<number | null>(null);
   const [displayMatchId, setDisplayMatchId] = useState<string | null>(null);
   const [nextMatch, setNextMatch] = useState<{ matchId: number; displayMatchId: string; chainCreated?: boolean } | null>(null);
@@ -2771,6 +2792,14 @@ function App() {
     setNextMatch(null);
     setActivePage(page);
   };
+
+  if (!chainReady) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#0a0a1a', color: 'var(--neon-green, #00ff88)', fontFamily: 'Orbitron, monospace' }}>
+        Loading...
+      </div>
+    );
+  }
 
   return (
     <WagmiProvider config={config}>
